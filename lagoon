@@ -323,6 +323,21 @@ function buildLayout() {
     }
     return best;
   };
+  const nodeById = new Map();
+  for (const g of nodes) nodeById.set(nodeKey(g), g);
+  const bindById = (id) => {
+    // the edge's own data-id names both nodes — trust it before geometry:
+    // a big node's border point can sit closer to ANOTHER node's center than
+    // its own (misbinds cross-cluster edges as self-loops, which never redraw)
+    const m = id.match(/^L_(.+)_(\d+)$/);
+    if (!m) return null;
+    const mid = m[1];
+    for (let cut = mid.indexOf("_"); cut > 0; cut = mid.indexOf("_", cut + 1)) {
+      const s = nodeById.get(mid.slice(0, cut)), t = nodeById.get(mid.slice(cut + 1));
+      if (s && t) return [s, t];
+    }
+    return null;
+  };
   const labelHost = new Map();
   const edges = [...svg.querySelectorAll("g.edgePaths path[data-id]")]
     .filter((p) => p.getAttribute("d"))
@@ -331,7 +346,11 @@ function buildLayout() {
       const nums = [];
       const skel = d.replace(/-?[\d.]+/g, (m) => (nums.push(+m), "\x01" + (nums.length - 1)));
       const ends = pathEnds(d);
-      return { p, d, skel, nums, src: nearest(ends[0]), tgt: nearest(ends[1]), lbl: null, lblT: null };
+      const byId = bindById(p.getAttribute("data-id"));
+      return { p, d, skel, nums,
+               src: byId ? byId[0] : nearest(ends[0]),
+               tgt: byId ? byId[1] : nearest(ends[1]),
+               lbl: null, lblT: null };
     });
   // mermaid tags the inner g.label with the edge's own data-id — exact binding,
   // no geometric guessing (nearby curves steal labels otherwise). The outer

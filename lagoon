@@ -19,7 +19,9 @@ panel: one tab per chart name (click or keys 1-8, 9 = last, • = changed while 
        c copies the mermaid source, x resets manual layout. dragging a node (or a
        subgraph's empty area) nudges it; edges and arrowheads follow, and nudges
        persist per chart; double-click an edge's text label to edit it (enter
-       saves, clear-all + enter removes). ctrl+tab / ctrl+shift+tab cycle the tab strip
+       saves, clear-all + enter removes). shift+drag on empty space
+       rubber-band-picks several cells to drag as one group; Esc or a plain
+       click clears the pick. ctrl+tab / ctrl+shift+tab cycle the tab strip
        (wrapping, merged tabs included); arrows walk the current view's history.
        lagoon panel a b (or the merge button: tabs become selectors, then
        "merge (N)" / cancel) opens a split compare — nodes only in a pane
@@ -105,6 +107,9 @@ PAGE = r"""<!doctype html>
                         background: #c9d4e3; vertical-align: -2px; margin-left: 1px;
                         animation: lagoon-blink 1s step-end infinite; }
   @keyframes lagoon-blink { 50% { opacity: 0; } }
+  .lagoon-marquee { position: absolute; border: 1px dashed #22d3ee; background: rgba(34, 211, 238, 0.08);
+                    pointer-events: none; z-index: 5; }
+  #chart g.node.sel { filter: drop-shadow(0 0 5px #22d3ee); }
   body.rebind #chart g.node { filter: drop-shadow(0 0 3px #3b82f6); }
   body.rebind #chart g.node:hover { filter: drop-shadow(0 0 6px #3b82f6); }
   #split { flex: 1 1 auto; display: flex; min-height: 0; }
@@ -122,7 +127,7 @@ PAGE = r"""<!doctype html>
 </head>
 <body>
 <div id="bar"><span id="name">lagoon</span><span id="pos"></span><span id="actions"><button id="undo" hidden title="undo manual layout tweaks (ctrl+z)">undo</button><button id="redo" hidden title="redo (ctrl+shift+z / ctrl+y)">redo</button><button id="reset" hidden title="clear all manual layout tweaks (x)">reset</button><button id="merge" title="pick charts to compare side by side">merge</button><button id="cancel" hidden>cancel</button><button id="copy" title="copy the mermaid source, without manual layout tweaks (c)">copy</button><button id="png" title="export the whole diagram as PNG (s)">png</button><button id="regen" title="re-render this chart from source, discarding render glitches">regen</button><label class="flag" title="keep mermaid/dagre's original edge routing for this chart instead of the border-anchored swoop"><input type="checkbox" id="legacy">dagre edges</label><button id="help" title="keyboard, drag, and edit reference">?</button></span></div>
-<div id="helpcard" hidden><p><b>tabs</b> — ctrl+tab / ctrl+shift+tab cycle the strip (wrapping, merged tabs included) · 1-8 jump by index, 9 = last · <i>latest</i> = live stream of every push · • = chart changed while away</p><p><b>history</b> — ←/→ walks the current view's versions · Esc: close help → cancel selection → leave merged view → jump to latest</p><p><b>shortcuts</b> — cmd/ctrl+R reset layout · cmd/ctrl+P or s = png · c or the copy button = mermaid source to clipboard · m merge toggle · c copy source · x reset tweaks · 0 or dblclick empty space = fit · +/- zoom · ctrl+z / ctrl+shift+z / ctrl+y undo-redo: layout tweaks first, then falls through to version history so edge edits undo too</p><p><b>drag</b> — 3px arms a drag (clicks never write offsets) · drag a gray cluster to move its members together · double-click a cell for edge edit mode: drag a blue X to re-point that edge, click an X to delete it, drag from the cell body to create a new edge (drop on itself = self-loop) · Esc cancels · every edge edit pushes a new version — undo with ←/→ · refuses chained-edge lines (A --> B --> C) and charts using linkStyle (positional indices would drift)</p><p><b>edges</b> — default: border-anchored swoopy connector between nodes, drawn on first render so dragging never snaps · "dagre edges" per-chart checkbox: mermaid's original routing preserved, stretched affinely on drags · double-click a line's label to edit its text (enter saves, esc cancels, clear-all + enter removes it)</p><p><b>png</b> — whole diagram at 2x to ~/Downloads, [open] button beside the save path · handles/ghosts never export</p><p><b>regen</b> — re-render this chart from source, clearing render glitches without touching history</p></div>
+<div id="helpcard" hidden><p><b>tabs</b> — ctrl+tab / ctrl+shift+tab cycle the strip (wrapping, merged tabs included) · 1-8 jump by index, 9 = last · <i>latest</i> = live stream of every push · • = chart changed while away</p><p><b>history</b> — ←/→ walks the current view's versions · Esc: close help → cancel selection → leave merged view → jump to latest</p><p><b>shortcuts</b> — cmd/ctrl+R reset layout · cmd/ctrl+P or s = png · c or the copy button = mermaid source to clipboard · m merge toggle · c copy source · x reset tweaks · 0 or dblclick empty space = fit · +/- zoom · ctrl+z / ctrl+shift+z / ctrl+y undo-redo: layout tweaks first, then falls through to version history so edge edits undo too</p><p><b>drag</b> — 3px arms a drag (clicks never write offsets) · drag a gray cluster to move its members together · double-click a cell for edge edit mode: drag a blue X to re-point that edge, click an X to delete it, drag from the cell body to create a new edge (drop on itself = self-loop) · Esc cancels · every edge edit pushes a new version — undo with ←/→ · refuses chained-edge lines (A --> B --> C) and charts using linkStyle (positional indices would drift)</p><p><b>select</b> — shift+drag on empty space rubber-band-picks several cells · shift+click adds/removes one · drag any picked cell to move them all · Esc or a plain click clears</p><p><b>edges</b> — default: border-anchored swoopy connector between nodes, drawn on first render so dragging never snaps · "dagre edges" per-chart checkbox: mermaid's original routing preserved, stretched affinely on drags · double-click a line's label to edit its text (enter saves, esc cancels, clear-all + enter removes it)</p><p><b>png</b> — whole diagram at 2x to ~/Downloads, [open] button beside the save path · handles/ghosts never export</p><p><b>regen</b> — re-render this chart from source, clearing render glitches without touching history</p></div>
 <div id="tabs"></div>
 <div id="split" hidden></div>
 <div id="stage"><div id="chart"></div><div id="msg" hidden></div></div>
@@ -472,6 +477,13 @@ let rebind = null;
 let createDrag = null;
 let ghost = null;
 let labelEdit = null;
+let marquee = null;
+const picked = new Set();  // shift-selected cells; dragging any one moves the whole set
+
+function markPicked() {
+  if (!layout) return;
+  for (const g of layout.nodes) g.classList.toggle("sel", picked.has(g));
+}
 
 function exitRebind() {
   if (!rebind) return;
@@ -800,6 +812,7 @@ $("reset").addEventListener("click", () => resetLayout());
 
 async function renderEntry(i) {
   exitRebind();
+  picked.clear();  // the rebuild replaces the DOM elements picked points at
   const list = viewList();
   cursor = Math.max(0, Math.min(i, list.length - 1));
   const e = list[cursor];
@@ -999,6 +1012,22 @@ stage.addEventListener("pointerdown", (ev) => {
       if (hit === rebind.src) createDrag = { x: ev.clientX, y: ev.clientY, pid: ev.pointerId, moved: false };
       return;
     }
+    if (ev.shiftKey && hit.classList.contains("node")) {
+      picked.has(hit) ? picked.delete(hit) : picked.add(hit);  // shift+click toggles one cell
+      markPicked();
+      return;
+    }
+    if (picked.size) {
+      if (picked.has(hit)) {
+        // drag one picked cell: the whole picked set moves together
+        const keys = [...picked].map(keyOf);
+        nodeDrag = { keys, base: keys.map((k) => [...(offsets[k] || [0, 0])]), x: ev.clientX, y: ev.clientY, moved: false, pid: ev.pointerId };
+        stage.classList.add("dragging");
+        return;
+      }
+      picked.clear();
+      markPicked();
+    }
     const keys = [keyOf(hit), ...(layout.members.get(hit) || []).map((m) => keyOf(m))];
     // no pointer capture yet: WebKit retargets click/dblclick at the capture
     // element, which would make every double-click land on #stage instead of
@@ -1007,11 +1036,44 @@ stage.addEventListener("pointerdown", (ev) => {
     stage.classList.add("dragging");
     return;
   }
+  if (ev.shiftKey && layout && !rebind) {
+    marquee = { x: ev.clientX, y: ev.clientY, moved: false, pid: ev.pointerId };
+    return;  // rubber band arms on move; capture deferred like node drags
+  }
+  if (picked.size) { picked.clear(); markPicked(); }
   drag = { x: ev.clientX, y: ev.clientY, tx: tx, ty: ty };
   stage.setPointerCapture(ev.pointerId);
   stage.classList.add("dragging");
 });
 stage.addEventListener("pointermove", (ev) => {
+  if (marquee) {
+    if (!marquee.moved) {
+      if (!armDrag(ev, marquee)) return;
+      marquee.moved = true;
+      stage.setPointerCapture(marquee.pid);
+      marquee.el = document.createElement("div");
+      marquee.el.className = "lagoon-marquee";
+      stage.appendChild(marquee.el);
+    }
+    const sr = stage.getBoundingClientRect();
+    const x0 = Math.min(marquee.x, ev.clientX) - sr.left, y0 = Math.min(marquee.y, ev.clientY) - sr.top;
+    const x1 = Math.max(marquee.x, ev.clientX) - sr.left, y1 = Math.max(marquee.y, ev.clientY) - sr.top;
+    marquee.el.style.left = x0 + "px";
+    marquee.el.style.top = y0 + "px";
+    marquee.el.style.width = (x1 - x0) + "px";
+    marquee.el.style.height = (y1 - y0) + "px";
+    // live hit test in svg space so the tint follows the band
+    const sx0 = (x0 - tx) / scale, sy0 = (y0 - ty) / scale;
+    const sx1 = (x1 - tx) / scale, sy1 = (y1 - ty) / scale;
+    for (const g of layout.nodes) {
+      const a = layout.anchor.get(g), o = totalOffset(g);
+      const hw = (layout.bbox.get(g) || [40, 20])[0], hh = (layout.bbox.get(g) || [40, 20])[1];
+      const cx = a[0] + o[0], cy = a[1] + o[1];
+      if (cx + hw > sx0 && cx - hw < sx1 && cy + hh > sy0 && cy - hh < sy1) picked.add(g);
+    }
+    markPicked();
+    return;
+  }
   if (createDrag) {
     if (!createDrag.moved) {
       if (!armDrag(ev, createDrag)) return;
@@ -1052,6 +1114,11 @@ stage.addEventListener("pointermove", (ev) => {
   apply();
 });
 const endDrag = (ev) => {
+  if (marquee) {
+    if (marquee.el) marquee.el.remove();
+    marquee = null;
+    return;
+  }
   if (createDrag) {
     const c = createDrag;
     createDrag = null;
@@ -1149,6 +1216,7 @@ addEventListener("keydown", (ev) => {
   if (ev.key === "Escape") {
     if (!$("helpcard").hidden) { $("helpcard").hidden = true; return; }
     if (rebind) { exitRebind(); $("pos").textContent = ""; return; }
+    if (picked.size) { picked.clear(); markPicked(); return; }
     if (selecting) { selecting = false; renderTabs(); return; }
     if (splitNames()) { location.hash = "latest"; return; }
     if (viewList().length) renderEntry(viewList().length - 1);

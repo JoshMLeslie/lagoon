@@ -801,8 +801,10 @@ async function renderEntry(i) {
     $("chart").innerHTML = out.svg || out;
     const sameChart = curChart === e.name;  // new version of the viewed chart: keep zoom/pan
     curChart = e.name;
-    loadOffsets(e.name);
-    loadFlags(e.name);
+    // awaited: applyAll must see the saved nudges and the dagre-edges flag, or
+    // every first paint — including each split pane — silently drops them
+    await loadOffsets(e.name);
+    await loadFlags(e.name);
     buildLayout();
     applyAll();
     if (!sameChart) fit();

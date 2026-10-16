@@ -15,8 +15,9 @@ commands:
 
 panel: one tab per chart name (click or keys 1-8, 9 = last, • = changed while away);
        drag pans, pinch / ctrl+wheel or + - zooms, 0 or double-click fits,
-       arrows walk the current view's history, Escape jumps to latest, s exports PNG,
-       c copies the mermaid source, x resets manual layout. dragging a node (or a
+       arrows walk the current view's history, Escape jumps to latest, s saves a PNG
+       to ~/Downloads, c copies the mermaid source, and the bar offers copy mmd /
+       copy png / save png / open file, x resets manual layout. dragging a node (or a
        subgraph's empty area) nudges it; edges and arrowheads follow, and nudges
        persist per chart; double-click an edge's text label to edit it (enter
        saves, clear-all + enter removes). shift+drag on empty space
@@ -86,7 +87,7 @@ PAGE = r"""<!doctype html>
   #msg { position: absolute; top: 12px; left: 12px; right: 12px;
          color: #ff7b72; white-space: pre-wrap; }
   #actions { display: flex; gap: 4px; flex: 0 0 auto; }
-  #png, #merge, #cancel, #undo, #redo, #reset, #copy, #regen, #help { background: #1a1f27; color: #c9ced6; border: 1px solid #2a3140;
+  #merge, #cancel, #undo, #redo, #reset, #openmmd, #copymmd, #copypng, #savepng, #regen, #help { background: #1a1f27; color: #c9ced6; border: 1px solid #2a3140;
                                                    border-radius: 4px; padding: 1px 8px; font: inherit; cursor: pointer; }
   #cancel[hidden] { display: none; }
   .tab.sel { outline: 2px solid #7aa2f7; }
@@ -99,7 +100,7 @@ PAGE = r"""<!doctype html>
   .lagoon-handle { stroke: #3b82f6; stroke-width: 2; fill: none; cursor: pointer; }
   .lagoon-handle circle { fill: transparent; }  /* invisible hit area around the X */
   .lagoon-ghost { stroke: #3b82f6; stroke-dasharray: 4 3; stroke-width: 1.5; pointer-events: none; }
-  #chart svg { overflow: visible; }  /* dragged content must paint past dagre's original bounds */
+  #chart svg { overflow: visible; -webkit-user-select: none; }  /* dragged content must paint past dagre's original bounds; WebKit otherwise treats shift+drag over SVG text as native selection */
   #chart g.edgeLabel { cursor: text; }
   .lagoon-edit { position: absolute; z-index: 20; background: #141821; border: 1px solid #3b82f6;
                  border-radius: 4px; padding: 3px 6px; font: inherit; color: #c9d4e3; white-space: pre; cursor: text; }
@@ -116,7 +117,7 @@ PAGE = r"""<!doctype html>
   #split[hidden] { display: none; }
   #split iframe { flex: 1 1 50%; border: 0; }
   #split iframe:not(:last-child) { border-right: 2px solid #3d4759; }
-  body.split-mode #stage, body.split-mode #png, body.split-mode #copy, body.split-mode #regen, body.split-mode .flag { display: none; }
+  body.split-mode #stage, body.split-mode #openmmd, body.split-mode #copymmd, body.split-mode #copypng, body.split-mode #savepng, body.split-mode #regen, body.split-mode .flag { display: none; }
   .flag { font: inherit; color: #9aa7b8; display: flex; align-items: center; gap: 4px; cursor: pointer; }
   #helpcard { position: absolute; top: 36px; right: 8px; max-width: 620px; z-index: 10; background: #141821;
               border: 1px solid #3d4759; border-radius: 6px; padding: 10px 14px; font-size: 12px;
@@ -126,8 +127,8 @@ PAGE = r"""<!doctype html>
 </style>
 </head>
 <body>
-<div id="bar"><span id="name">lagoon</span><span id="pos"></span><span id="actions"><button id="undo" hidden title="undo manual layout tweaks (ctrl+z)">undo</button><button id="redo" hidden title="redo (ctrl+shift+z / ctrl+y)">redo</button><button id="reset" hidden title="clear all manual layout tweaks (x)">reset</button><button id="merge" title="pick charts to compare side by side">merge</button><button id="cancel" hidden>cancel</button><button id="copy" title="copy the mermaid source, without manual layout tweaks (c)">copy</button><button id="png" title="export the whole diagram as PNG (s)">png</button><button id="regen" title="re-render this chart from source, discarding render glitches">regen</button><label class="flag" title="keep mermaid/dagre's original edge routing for this chart instead of the border-anchored swoop"><input type="checkbox" id="legacy">dagre edges</label><button id="help" title="keyboard, drag, and edit reference">?</button></span></div>
-<div id="helpcard" hidden><p><b>tabs</b> — ctrl+tab / ctrl+shift+tab cycle the strip (wrapping, merged tabs included) · 1-8 jump by index, 9 = last · <i>latest</i> = live stream of every push · • = chart changed while away</p><p><b>history</b> — ←/→ walks the current view's versions · Esc: close help → cancel selection → leave merged view → jump to latest</p><p><b>shortcuts</b> — cmd/ctrl+R reset layout · cmd/ctrl+P or s = png · c or the copy button = mermaid source to clipboard · m merge toggle · c copy source · x reset tweaks · 0 or dblclick empty space = fit · +/- zoom · ctrl+z / ctrl+shift+z / ctrl+y undo-redo: layout tweaks first, then falls through to version history so edge edits undo too</p><p><b>drag</b> — 3px arms a drag (clicks never write offsets) · drag a gray cluster to move its members together · double-click a cell for edge edit mode: drag a blue X to re-point that edge, click an X to delete it, drag from the cell body to create a new edge (drop on itself = self-loop) · Esc cancels · every edge edit pushes a new version — undo with ←/→ · refuses chained-edge lines (A --> B --> C) and charts using linkStyle (positional indices would drift)</p><p><b>select</b> — shift+drag on empty space (or a subgraph's background) rubber-band-picks several cells · shift+click adds/removes one · drag any picked cell, shift held or not, to move them all · Esc or a plain click clears</p><p><b>edges</b> — default: border-anchored swoopy connector between nodes, drawn on first render so dragging never snaps · "dagre edges" per-chart checkbox: mermaid's original routing preserved, stretched affinely on drags · double-click a line's label to edit its text (enter saves, esc cancels, clear-all + enter removes it)</p><p><b>png</b> — whole diagram at 2x to ~/Downloads, [open] button beside the save path · handles/ghosts never export</p><p><b>regen</b> — re-render this chart from source, clearing render glitches without touching history</p></div>
+<div id="bar"><span id="name">lagoon</span><span id="pos"></span><span id="actions"><button id="undo" hidden title="undo manual layout tweaks (ctrl+z)">undo</button><button id="redo" hidden title="redo (ctrl+shift+z / ctrl+y)">redo</button><button id="reset" hidden title="clear all manual layout tweaks (x)">reset</button><button id="merge" title="pick charts to compare side by side">merge</button><button id="cancel" hidden>cancel</button><button id="openmmd" title="open this chart's .mmd source file in your editor">open file</button><button id="copymmd" title="copy the mermaid source, without manual layout tweaks (c)">copy mmd</button><button id="copypng" title="copy the rendered diagram as a PNG image to the clipboard">copy png</button><button id="savepng" title="export the whole diagram as 2x PNG to ~/Downloads (s)">save png</button><button id="regen" title="re-render this chart from source, discarding render glitches">regen</button><label class="flag" title="keep mermaid/dagre's original edge routing for this chart instead of the border-anchored swoop"><input type="checkbox" id="legacy">dagre edges</label><button id="help" title="keyboard, drag, and edit reference">?</button></span></div>
+<div id="helpcard" hidden><p><b>tabs</b> — ctrl+tab / ctrl+shift+tab cycle the strip (wrapping, merged tabs included) · 1-8 jump by index, 9 = last · <i>latest</i> = live stream of every push · • = chart changed while away</p><p><b>history</b> — ←/→ walks the current view's versions · Esc: close help → cancel selection → leave merged view → jump to latest</p><p><b>shortcuts</b> — cmd/ctrl+R reset layout · cmd/ctrl+P or s = png · c or the copy button = mermaid source to clipboard · m merge toggle · c copy source · x reset tweaks · 0 or dblclick empty space = fit · +/- zoom · ctrl+z / ctrl+shift+z / ctrl+y undo-redo: layout tweaks first, then falls through to version history so edge edits undo too</p><p><b>drag</b> — 3px arms a drag (clicks never write offsets) · drag a gray cluster to move its members together · double-click a cell for edge edit mode: drag a blue X to re-point that edge, click an X to delete it, drag from the cell body to create a new edge (drop on itself = self-loop) · Esc cancels · every edge edit pushes a new version — undo with ←/→ · refuses chained-edge lines (A --> B --> C) and charts using linkStyle (positional indices would drift)</p><p><b>select</b> — shift+drag on empty space (or a subgraph's background) rubber-band-picks several cells · shift+click adds/removes one · drag any picked cell, shift held or not, to move them all · Esc or a plain click clears</p><p><b>edges</b> — default: border-anchored swoopy connector between nodes, drawn on first render so dragging never snaps · "dagre edges" per-chart checkbox: mermaid's original routing preserved, stretched affinely on drags · double-click a line's label to edit its text (enter saves, esc cancels, clear-all + enter removes it)</p><p><b>png</b> — save png: 2x image to ~/Downloads, [open] button beside the path · copy png: image straight to the clipboard · copy mmd: source without manual layout tweaks · open file: the chart's .mmd in your default editor · handles/ghosts never export</p><p><b>regen</b> — re-render this chart from source, clearing render glitches without touching history</p></div>
 <div id="tabs"></div>
 <div id="split" hidden></div>
 <div id="stage"><div id="chart"></div><div id="msg" hidden></div></div>
@@ -813,11 +814,11 @@ function posSaved(path) {
   pos.appendChild(document.createTextNode("image saved at " + path));
 }
 
-async function exportPng() {
-  if (splitNames()) return;
+async function renderPng() {
+  if (splitNames()) return null;
   const e = viewList()[cursor];
   const svg = $("chart").querySelector("svg");
-  if (!e || !svg) return;
+  if (!e || !svg) return null;
   const clone = svg.cloneNode(true);
   deForeign(clone);
   clone.querySelectorAll(".lagoon-handle, .lagoon-ghost").forEach((h) => h.remove());
@@ -840,24 +841,48 @@ async function exportPng() {
     ctx.fillStyle = "#0f1115";
     ctx.fillRect(0, 0, cv.width, cv.height);
     ctx.drawImage(img, 0, 0, cv.width, cv.height);
-    const dataUrl = cv.toDataURL("image/png");
-    const fname = "lagoon-" + e.name + "-" + e.ver + ".png";
-    const api = topApi();
-    if (api) {
-      posSaved(await api.save_png(fname, dataUrl));
-    } else {
-      const a = document.createElement("a");
-      a.href = dataUrl; a.download = fname; a.click();
-      $("pos").textContent = "downloaded " + fname;
-    }
+    return { dataUrl: cv.toDataURL("image/png"), fname: "lagoon-" + e.name + "-" + e.ver + ".png" };
   } catch (err) {
     show("png export failed: " + String(err));
+    return null;
   } finally {
     URL.revokeObjectURL(url);
   }
 }
-$("png").addEventListener("click", () => exportPng());
-$("copy").addEventListener("click", () => copySource());
+
+async function savePng() {
+  const out = await renderPng();
+  if (!out) return;
+  const api = topApi();
+  if (api) {
+    posSaved(await api.save_png(out.fname, out.dataUrl));
+  } else {
+    const a = document.createElement("a");
+    a.href = out.dataUrl; a.download = out.fname; a.click();
+    $("pos").textContent = "downloaded " + out.fname;
+  }
+}
+
+async function copyPng() {
+  const out = await renderPng();
+  if (!out) return;
+  try {
+    const blob = await (await fetch(out.dataUrl)).blob();
+    await navigator.clipboard.write([new ClipboardItem({ "image/png": blob })]);
+    $("pos").textContent = "png copied to clipboard";
+  } catch (err) {
+    $("pos").textContent = "clipboard blocked: " + String(err);
+  }
+}
+$("openmmd").addEventListener("click", async () => {
+  const api = topApi();
+  if (!api) { $("pos").textContent = "open file needs the panel"; return; }
+  if (curChart && await api.open_chart_file(curChart)) return;
+  $("pos").textContent = "no source file for " + curChart;
+});
+$("copymmd").addEventListener("click", () => copySource());
+$("copypng").addEventListener("click", () => copyPng());
+$("savepng").addEventListener("click", () => savePng());
 $("regen").addEventListener("click", () => renderEntry(cursor));
 $("help").addEventListener("click", () => { $("helpcard").hidden = !$("helpcard").hidden; });
 document.addEventListener("click", (ev) => { if (!$("helpcard").hidden && !ev.target.closest("#help, #helpcard")) $("helpcard").hidden = true; });
@@ -1084,6 +1109,7 @@ stage.addEventListener("pointerdown", (ev) => {
     return;  // labels aren't drag surfaces — no capture taken, so dblclick reaches them (WebKit retargets clicks at capture elements)
   const nodeHit = layout && closest(ev.target, "g.node");
   if (ev.shiftKey && layout && !rebind && !(nodeHit && layout.svg.contains(nodeHit))) {
+    ev.preventDefault();  // WebKit: shift+drag over SVG is a native text-selection gesture otherwise — it pointercancels mid-drag
     // rubber band from anywhere that isn't a cell itself — including a
     // subgraph's background, where a shift-drag would otherwise cluster-drag
     marquee = { x: ev.clientX, y: ev.clientY, moved: false, pid: ev.pointerId };
@@ -1098,6 +1124,7 @@ stage.addEventListener("pointerdown", (ev) => {
       return;
     }
     if (ev.shiftKey && hit.classList.contains("node")) {
+      ev.preventDefault();  // same WebKit selection gesture
       // shift+click a cell toggles it; shift+DRAG from a cell moves the picked
       // set (adding it) — decided at arm time, so holding shift through the
       // whole gesture never un-picks the cell you meant to move
@@ -1331,7 +1358,7 @@ addEventListener("keydown", (ev) => {
   }
   const meta = ev.metaKey || ev.ctrlKey;  // cmd on macOS, ctrl on Linux/GTK
   if (meta && (ev.key === "r" || ev.key === "R")) { ev.preventDefault(); resetLayout(); return; }
-  if (meta && (ev.key === "p" || ev.key === "P")) { ev.preventDefault(); exportPng(); return; }
+  if (meta && (ev.key === "p" || ev.key === "P")) { ev.preventDefault(); savePng(); return; }
   if ((ev.key === "m" || ev.key === "M") && !meta) { toggleMerge(); return; }
   if (splitNames()) return;
   if (meta && (ev.key === "z" || ev.key === "y")) {
@@ -1354,7 +1381,7 @@ addEventListener("keydown", (ev) => {
   else if (ev.key === "+" || ev.key === "=") zoomCenter(1.25);
   else if (ev.key === "-") zoomCenter(0.8);
   else if (ev.key === "0") fit();
-  else if (ev.key === "s") exportPng();
+  else if (ev.key === "s") savePng();
   else if (ev.key === "c") copySource();
   else if (ev.key === "x") resetLayout();
 });
@@ -1998,6 +2025,15 @@ class PanelApi:
         if p.suffix != ".png" or p.parent != Path.home() / "Downloads" or not p.is_file():
             return False
         subprocess.Popen(["open" if sys.platform == "darwin" else "xdg-open", str(p)])
+        return True
+
+    def open_chart_file(self, name):
+        if bad_name(name):
+            return False
+        f = DIR / "charts" / f"{name}.mmd"
+        if not f.is_file():
+            return False
+        subprocess.Popen(["open" if sys.platform == "darwin" else "xdg-open", str(f)])
         return True
 
 

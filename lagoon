@@ -110,7 +110,7 @@ PAGE = r"""<!doctype html>
   @keyframes lagoon-blink { 50% { opacity: 0; } }
   .lagoon-marquee { position: absolute; border: 1px dashed #22d3ee; background: rgba(34, 211, 238, 0.08);
                     pointer-events: none; z-index: 5; }
-  #chart g.node.sel { filter: drop-shadow(0 0 5px #22d3ee); }
+  #chart g.node.sel rect, #chart g.node.sel polygon, #chart g.node.sel circle, #chart g.node.sel ellipse, #chart g.node.sel path { stroke: #22d3ee !important; stroke-width: 2 !important; }  /* drop-shadow filters don't render on SVG groups in WebKit */
   body.rebind #chart g.node { filter: drop-shadow(0 0 3px #3b82f6); }
   body.rebind #chart g.node:hover { filter: drop-shadow(0 0 6px #3b82f6); }
   #split { flex: 1 1 auto; display: flex; min-height: 0; }

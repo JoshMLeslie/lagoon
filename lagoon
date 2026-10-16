@@ -57,6 +57,7 @@ DIR = Path(os.environ.get("LAGOON_DIR") or Path.home() / ".local" / "state" / "l
 SOCK = DIR / "lagoon.sock"
 PORT = int(os.environ.get("LAGOON_PORT", "52466"))
 NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+SIDECARS = {"flags": ".flags.json", "offsets": ".offsets.json"}  # per-chart json sidecars share one GET/POST shape
 MERMAID_URLS = (
     "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js",
     "https://unpkg.com/mermaid@11/dist/mermaid.min.js",
@@ -129,6 +130,7 @@ PAGE = r"""<!doctype html>
 <script>
 const $ = (id) => document.getElementById(id);
 const stage = $("stage");
+const closest = (el, sel) => el && el.closest ? el.closest(sel) : null;
 if (window.self !== window.top) document.body.classList.add("embedded");
 let hist = [];
 let pinned = null;
@@ -152,6 +154,13 @@ const splitNames = () => {
 };
 const viewList = () => (pinned === null ? hist : hist.filter((e) => e.name === pinned));
 const tabNames = () => ["latest", ...new Set(hist.map((e) => e.name)), ...mergedList.map((m) => m.id)];
+const currentTab = () => {
+  const sp = splitNames();
+  if (sp) return sp.join("+");
+  if (pinned !== null) return pinned;
+  const list = viewList();
+  return list[cursor] && cursor < list.length - 1 ? list[cursor].name : "latest";
+};
 
 function show(text) {
   $("msg").hidden = false;
@@ -475,6 +484,16 @@ function edgeSourceInfo(edge) {
   return { e, lines, idx, src: m[1], tgt: m[2] };
 }
 
+async function pushChart(name, mmd) {
+  // the one commit path for re-point / delete / create / label edit
+  try {
+    const r = await fetch("/chart/" + encodeURIComponent(name), { method: "POST", body: mmd });
+    return r.ok ? null : "HTTP " + r.status;
+  } catch (err) {
+    return String(err);
+  }
+}
+
 async function rewriteEdge(edge, newTgt) {
   const info = edgeSourceInfo(edge);
   if (typeof info === "string") return $("pos").textContent = info;
@@ -492,12 +511,8 @@ async function rewriteEdge(edge, newTgt) {
   } else {
     lines[idx] = line.replace(new RegExp("(^|[\\s&])" + escRe(tgt) + "(?=[\\s&|]|$)"), (mm, pre) => pre + newTgt);
   }
-  try {
-    const r = await fetch("/chart/" + encodeURIComponent(e.name), { method: "POST", body: lines.join("\n") });
-    if (!r.ok) $("pos").textContent = "edge edit failed: HTTP " + r.status;
-  } catch (err) {
-    $("pos").textContent = "edge edit failed: " + String(err);
-  }
+  const err = await pushChart(e.name, lines.join("\n"));
+  if (err) $("pos").textContent = "edge edit failed: " + err;
 }
 
 async function createEdge(src, tgt) {
@@ -505,12 +520,8 @@ async function createEdge(src, tgt) {
   if (!e || e.name !== curChart) return;
   if (/linkStyle/i.test(e.mmd)) return $("pos").textContent = "this chart uses linkStyle — edge edits disabled (indices would drift)";
   const mmd = e.mmd.replace(/\s*$/, "") + "\n" + src + " --> " + tgt;
-  try {
-    const r = await fetch("/chart/" + encodeURIComponent(e.name), { method: "POST", body: mmd });
-    if (!r.ok) $("pos").textContent = "edge create failed: HTTP " + r.status;
-  } catch (err) {
-    $("pos").textContent = "edge create failed: " + String(err);
-  }
+  const err = await pushChart(e.name, mmd);
+  if (err) $("pos").textContent = "edge create failed: " + err;
 }
 
 function cancelLabelEdit() {
@@ -552,12 +563,8 @@ async function commitLabelEdit() {
   }
   if (line === lines[idx]) { $("pos").textContent = "label unchanged"; return; }
   lines[idx] = line;
-  try {
-    const r = await fetch("/chart/" + encodeURIComponent(e.name), { method: "POST", body: lines.join("\n") });
-    if (!r.ok) $("pos").textContent = "label edit failed: HTTP " + r.status;
-  } catch (err) {
-    $("pos").textContent = "label edit failed: " + String(err);
-  }
+  const err = await pushChart(e.name, lines.join("\n"));
+  if (err) $("pos").textContent = "label edit failed: " + err;
 }
 
 function editEdgeLabel(edge) {
@@ -621,8 +628,7 @@ function enterRebind(node) {
         window.removeEventListener("pointermove", onMove);
         exitRebind();
         if (!moved) { await rewriteEdge(e, null); return; }
-        const hit = document.elementFromPoint(ev2.clientX, ev2.clientY);
-        const rec = hit && hit.closest ? hit.closest("g.node") : null;
+        const rec = closest(document.elementFromPoint(ev2.clientX, ev2.clientY), "g.node");
         if (rec && layout && layout.svg.contains(rec)) await rewriteEdge(e, nodeKey(rec));
       };
       window.addEventListener("pointermove", onMove);
@@ -753,13 +759,7 @@ $("legacy").addEventListener("change", async () => {
 
 function cycleTabs(shift) {
   const names = tabNames();
-  const sp = splitNames();
-  const list = viewList();
-  const cur = sp ? sp.join("+")
-    : pinned !== null ? pinned
-    : list[cursor] && cursor < list.length - 1 ? list[cursor].name
-    : "latest";
-  const i = names.indexOf(cur);
+  const i = names.indexOf(currentTab());
   if (i < 0) { location.hash = "latest"; return; }
   const j = shift ? (i <= 0 ? names.length - 1 : i - 1) : (i >= names.length - 1 ? 0 : i + 1);
   location.hash = names[j] === "latest" ? "latest" : names[j];
@@ -812,14 +812,8 @@ async function renderEntry(i) {
 }
 
 function renderTabs() {
-  const list = viewList();
-  const viewed = list[cursor];
-  const sp = splitNames();
-  const cur = sp ? sp.join("+")
-    : pinned !== null ? pinned
-    : viewed && cursor < list.length - 1 ? viewed.name
-    : "latest";
   const names = tabNames();
+  const cur = currentTab();
   const wrap = $("tabs");
   wrap.innerHTML = "";
   for (const n of names) {
@@ -969,13 +963,13 @@ let drag = null;
 stage.addEventListener("pointerdown", (ev) => {
   if (labelEdit) {
     // click away cancels the label editor; clicks on the editor itself do nothing
-    if (!(ev.target.closest && ev.target.closest(".lagoon-edit"))) cancelLabelEdit();
+    if (!closest(ev.target, ".lagoon-edit")) cancelLabelEdit();
     return;
   }
-  const lblHit = ev.target.closest ? ev.target.closest("g.edgeLabel") : null;
+  const lblHit = closest(ev.target, "g.edgeLabel");
   if (lblHit && layout && layout.svg.contains(lblHit))
     return;  // labels aren't drag surfaces — no capture taken, so dblclick reaches them (WebKit retargets clicks at capture elements)
-  const hit = layout && ev.target.closest ? ev.target.closest("g.node, g.cluster") : null;
+  const hit = layout && closest(ev.target, "g.node, g.cluster");
   if (hit && layout && layout.svg.contains(hit)) {
     if (rebind) {
       // in rebind mode the double-clicked cell drags out a NEW edge; other
@@ -1041,8 +1035,7 @@ const endDrag = (ev) => {
     createDrag = null;
     if (ghost) { ghost.remove(); ghost = null; }
     if (c.moved && ev && ev.type === "pointerup") {
-      const el = document.elementFromPoint(ev.clientX, ev.clientY);
-      const rec = el && el.closest ? el.closest("g.node") : null;
+      const rec = closest(document.elementFromPoint(ev.clientX, ev.clientY), "g.node");
       if (rec && layout && layout.svg.contains(rec)) {
         const src = nodeKey(rebind.src), tgt = nodeKey(rec);
         exitRebind();
@@ -1063,12 +1056,12 @@ const endDrag = (ev) => {
 stage.addEventListener("pointerup", endDrag);
 stage.addEventListener("pointercancel", endDrag);
 stage.addEventListener("dblclick", (ev) => {
-  const lblHit = ev.target.closest ? ev.target.closest("g.edgeLabel") : null;
+  const lblHit = closest(ev.target, "g.edgeLabel");
   if (lblHit && layout && layout.svg.contains(lblHit)) {
     const edge = layout.edges.find((e) => e.lbl === lblHit);
     if (edge) { ev.stopPropagation(); ev.preventDefault(); editEdgeLabel(edge); return; }
   }
-  const hit = ev.target.closest ? ev.target.closest("g.node") : null;
+  const hit = closest(ev.target, "g.node");
   if (hit && layout && layout.svg.contains(hit)) { ev.stopPropagation(); enterRebind(hit); return; }
   fit();
 });
@@ -1199,6 +1192,10 @@ def utcnow():
 
 def bad_name(name):
     return not NAME_RE.match(name) or name == "latest"
+
+
+def exit_bad_name():
+    sys.exit("lagoon: names are [A-Za-z0-9._-], up to 64 chars ('latest' is reserved)")
 
 
 def ensure_mermaid():
@@ -1395,24 +1392,22 @@ class Daemon:
                     headers[k.strip().lower()] = v.strip()
             parts = first.decode("latin-1").split()
             method, path = (parts[0].upper(), parts[1].split("?", 1)[0]) if len(parts) >= 2 else ("", "")
-            if method == "POST" and path.startswith("/flags/"):
-                name = path[len("/flags/"):]
+            for kind, suffix in SIDECARS.items():
+                if not path.startswith("/" + kind + "/"):
+                    continue
+                name = path[len(kind) + 2:]
                 if bad_name(name):
                     return await reply(writer, "400 Bad Request", "text/plain", "bad name")
-                obj = await read_body(reader, headers)
-                if obj is None or not isinstance(obj, dict):
-                    return await reply(writer, "400 Bad Request", "text/plain", "bad flags")
-                (DIR / "charts" / f"{name}.flags.json").write_text(json.dumps(obj))
-                return await reply_json(writer, {"ok": True})
-            if method == "POST" and path.startswith("/offsets/"):
-                name = path[len("/offsets/"):]
-                if bad_name(name):
-                    return await reply(writer, "400 Bad Request", "text/plain", "bad name")
-                obj = await read_body(reader, headers)
-                if obj is None or not isinstance(obj, dict):
-                    return await reply(writer, "400 Bad Request", "text/plain", "bad offsets")
-                (DIR / "charts" / f"{name}.offsets.json").write_text(json.dumps(obj))
-                return await reply(writer, "200 OK", "application/json", '{"ok": true}')
+                f = DIR / "charts" / f"{name}{suffix}"
+                if method == "POST":
+                    obj = await read_body(reader, headers)
+                    if obj is None or not isinstance(obj, dict):
+                        return await reply(writer, "400 Bad Request", "text/plain", "bad payload")
+                    f.write_text(json.dumps(obj))
+                    return await reply(writer, "200 OK", "application/json", '{"ok": true}')
+                if method != "GET":
+                    return await reply(writer, "405 Method Not Allowed", "text/plain", "GET only")
+                return await reply(writer, "200 OK", "application/json", f.read_text() if f.exists() else "{}")
             if method == "POST" and path.startswith("/chart/"):
                 name = path[len("/chart/"):]
                 if bad_name(name):
@@ -1478,18 +1473,6 @@ class Daemon:
                 if not NAME_RE.match(name) or not chart.exists():
                     return await reply(writer, "404 Not Found", "text/plain", "no such chart")
                 return await reply(writer, "200 OK", "text/plain; charset=utf-8", chart.read_text())
-            if path.startswith("/flags/"):
-                name = path[len("/flags/"):]
-                f = DIR / "charts" / f"{name}.flags.json"
-                if bad_name(name):
-                    return await reply(writer, "400 Bad Request", "text/plain", "bad name")
-                return await reply(writer, "200 OK", "application/json", f.read_text() if f.exists() else "{}")
-            if path.startswith("/offsets/"):
-                name = path[len("/offsets/"):]
-                f = DIR / "charts" / f"{name}.offsets.json"
-                if bad_name(name):
-                    return await reply(writer, "400 Bad Request", "text/plain", "bad name")
-                return await reply(writer, "200 OK", "application/json", f.read_text() if f.exists() else "{}")
             if path == "/merges":
                 return await reply(writer, "200 OK", "application/json", json.dumps(self.store.merges))
             if path == "/events":
@@ -1728,6 +1711,13 @@ def sock_request(payload):
     sys.exit(f"lagoon: bad response: {buf[:200]!r}")
 
 
+def ask(payload):
+    resp = sock_request(payload)
+    if not resp.get("ok"):
+        sys.exit("lagoon: " + str(resp.get("error")))
+    return resp
+
+
 def ensure_daemon():
     if daemon_running():
         return
@@ -1796,7 +1786,7 @@ def cmd_serve(args):
 def cmd_panel(args):
     for n in args.names:
         if bad_name(n):
-            sys.exit("lagoon: names are [A-Za-z0-9._-], up to 64 chars ('latest' is reserved)")
+            exit_bad_name()
     ensure_daemon()
     if len(args.names) >= 2:
         with contextlib.suppress(SystemExit):
@@ -1973,29 +1963,23 @@ def cmd_open(args):
 
 def cmd_push(args):
     if bad_name(args.name):
-        sys.exit("lagoon: names are [A-Za-z0-9._-], up to 64 chars ('latest' is reserved)")
+        exit_bad_name()
     data = sys.stdin.read()
     if not data.strip():
         sys.exit("lagoon: empty stdin")
-    resp = sock_request(f"push {args.name}\n{data}\n")
-    if not resp.get("ok"):
-        sys.exit("lagoon: " + str(resp.get("error")))
+    resp = ask(f"push {args.name}\n{data}\n")
     print(f"pushed {resp['name']} (ver {resp['ver']})")
 
 
 def cmd_show(args):
     if bad_name(args.name):
-        sys.exit("lagoon: names are [A-Za-z0-9._-], up to 64 chars ('latest' is reserved)")
-    resp = sock_request(f"show {args.name}\n")
-    if not resp.get("ok"):
-        sys.exit("lagoon: " + str(resp.get("error")))
+        exit_bad_name()
+    resp = ask(f"show {args.name}\n")
     print(f"showing {resp['name']} (ver {resp['ver']})")
 
 
 def cmd_list(args):
-    resp = sock_request("list\n")
-    if not resp.get("ok"):
-        sys.exit("lagoon: " + str(resp.get("error")))
+    resp = ask("list\n")
     for name in resp["charts"]:
         print(("* " if name == resp.get("current") else "  ") + name)
     for mid in resp.get("merges", []):
@@ -2006,9 +1990,7 @@ def cmd_unmerge(args):
     parts = args.id.split("+")
     if len(parts) < 2 or any(bad_name(p) for p in parts):
         sys.exit("lagoon: merged view ids look like 'chart-a+chart-b'")
-    resp = sock_request(f"unmerge {args.id}\n")
-    if not resp.get("ok"):
-        sys.exit("lagoon: " + str(resp.get("error")))
+    resp = ask(f"unmerge {args.id}\n")
     print("removed merged view " + resp["removed"])
 
 
@@ -2017,29 +1999,23 @@ def cmd_compare(args):
         sys.exit("lagoon: compare needs 2+ chart names")
     for n in args.names:
         if bad_name(n):
-            sys.exit("lagoon: names are [A-Za-z0-9._-], up to 64 chars ('latest' is reserved)")
-    resp = sock_request("compare " + " ".join(args.names) + "\n")
-    if not resp.get("ok"):
-        sys.exit("lagoon: " + str(resp.get("error")))
+            exit_bad_name()
+    resp = ask("compare " + " ".join(args.names) + "\n")
     print("comparing " + " | ".join(resp["charts"]) + f" ({resp['panels']} panel(s) connected)")
 
 
 def cmd_offsets(args):
     if bad_name(args.name):
-        sys.exit("lagoon: names are [A-Za-z0-9._-], up to 64 chars ('latest' is reserved)")
-    resp = sock_request(f"offsets {args.name}\n")
-    if not resp.get("ok"):
-        sys.exit("lagoon: " + str(resp.get("error")))
+        exit_bad_name()
+    resp = ask(f"offsets {args.name}\n")
     print(json.dumps(resp["offsets"], indent=2))
 
 
 def cmd_history(args):
     name = args.name or ""
     if name and bad_name(name):
-        sys.exit("lagoon: names are [A-Za-z0-9._-], up to 64 chars ('latest' is reserved)")
-    resp = sock_request(("history " + name).strip() + "\n")
-    if not resp.get("ok"):
-        sys.exit("lagoon: " + str(resp.get("error")))
+        exit_bad_name()
+    resp = ask(("history " + name).strip() + "\n")
     for e in resp["entries"]:
         print(f"{e['ver']:>4}  {e['at']}  {e['name']}")
 

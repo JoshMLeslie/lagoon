@@ -1,0 +1,2091 @@
+#!/usr/bin/env python3
+"""lagoon — a small floating mermaid portal.
+
+commands:
+  serve          run the daemon (unix socket + http on 127.0.0.1)
+  panel [names]  open panel window(s); each given name pins that chart, none = live stream
+  push [name]    push mermaid from stdin to the portal
+  show <name>    bring a named chart back to the portal
+  list           list charts (* marks current)
+  compare <a> <b> [...]  open a split compare of charts on the portal (persists as a tab)
+  unmerge <a+b>  remove a persisted merged view
+  offsets <name> print a chart's stored drag nudges
+  history [name] print recent pushes (all charts, or one)
+  open           open the portal in the default browser
+
+panel: one tab per chart name (click or keys 1-8, 9 = last, • = changed while away);
+       drag pans, pinch / ctrl+wheel or + - zooms, 0 or double-click fits,
+       arrows walk the current view's history, Escape jumps to latest, s exports PNG,
+       c copies the mermaid source, x resets manual layout. dragging a node (or a
+       subgraph's empty area) nudges it; edges and arrowheads follow, and nudges
+       persist per chart; double-click an edge's text label to edit it (enter
+       saves, clear-all + enter removes). ctrl+tab / ctrl+shift+tab cycle the tab strip
+       (wrapping, merged tabs included); arrows walk the current view's history.
+       lagoon panel a b (or the merge button: tabs become selectors, then
+       "merge (N)" / cancel) opens a split compare — nodes only in a pane
+       tint that pane's color; "end merge" or Escape returns. Merge supports
+       2+ charts.
+
+agents / cli can drive it directly, no lagoon binary needed:
+  unix socket   ~/.local/state/lagoon/lagoon.sock — one request per connection:
+                 first line: "push <name>" | "show <name>" | "list" |
+                 "compare <a> <b> [...]" | "offsets <name>" | "history [name]",
+                 then mermaid text for push, then half-close:
+                 printf 'graph TD\nA-->B\n' | nc -U ~/.local/state/lagoon/lagoon.sock
+  filesystem    ~/.local/state/lagoon/current.mmd — write mermaid here; polled and ingested
+
+env: LAGOON_DIR (default ~/.local/state/lagoon), LAGOON_PORT (default 52466)
+"""
+import argparse
+import asyncio
+import base64
+import contextlib
+import json
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import time
+import urllib.request
+import webbrowser
+from datetime import datetime, timezone
+from pathlib import Path
+
+DIR = Path(os.environ.get("LAGOON_DIR") or Path.home() / ".local" / "state" / "lagoon")
+SOCK = DIR / "lagoon.sock"
+PORT = int(os.environ.get("LAGOON_PORT", "52466"))
+NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+MERMAID_URLS = (
+    "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js",
+    "https://unpkg.com/mermaid@11/dist/mermaid.min.js",
+)
+HIST_KEEP = 500
+
+PAGE = r"""<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Lagoon</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { height: 100%; margin: 0; }
+  body { background: #0f1115; color: #c9ced6; font: 12px ui-monospace, Menlo, monospace;
+         display: flex; flex-direction: column; }
+  #bar { flex: 0 0 auto; display: flex; justify-content: space-between; gap: 8px;
+         padding: 4px 10px; border-bottom: 1px solid #232933; user-select: none;
+         overflow: hidden; white-space: nowrap; }
+  #stage { flex: 1 1 auto; overflow: hidden; position: relative;
+           touch-action: none; user-select: none; cursor: grab; }
+  #stage.dragging { cursor: grabbing; }
+  #chart { position: absolute; top: 0; left: 0; transform-origin: 0 0; }
+  #msg { position: absolute; top: 12px; left: 12px; right: 12px;
+         color: #ff7b72; white-space: pre-wrap; }
+  #actions { display: flex; gap: 4px; flex: 0 0 auto; }
+  #png, #merge, #cancel, #undo, #redo, #reset { background: #1a1f27; color: #c9ced6; border: 1px solid #2a3140;
+                                                   border-radius: 4px; padding: 1px 8px; font: inherit; cursor: pointer; }
+  #cancel[hidden] { display: none; }
+  .tab.sel { outline: 2px solid #7aa2f7; }
+  #tabs { flex: 0 0 auto; display: flex; gap: 2px; padding: 3px 6px;
+          border-bottom: 1px solid #232933; overflow-x: auto; user-select: none; }
+  .tab { flex: 0 0 auto; padding: 1px 8px; border: 1px solid #2a3140;
+         border-radius: 4px; background: #141821; cursor: pointer; }
+  .tab.active { background: #232b38; border-color: #3d4759; }
+  #chart .node, #chart .cluster { cursor: move; }
+  .lagoon-handle { stroke: #3b82f6; stroke-width: 2; fill: none; cursor: pointer; }
+  .lagoon-handle circle { fill: transparent; }  /* invisible hit area around the X */
+  .lagoon-ghost { stroke: #3b82f6; stroke-dasharray: 4 3; stroke-width: 1.5; pointer-events: none; }
+  #chart svg { overflow: visible; }  /* dragged content must paint past dagre's original bounds */
+  #chart g.edgeLabel { cursor: text; }
+  .lagoon-edit { position: absolute; z-index: 20; background: #141821; border: 1px solid #3b82f6;
+                 border-radius: 4px; padding: 3px 6px; font: inherit; color: #c9d4e3; white-space: pre; cursor: text; }
+  .lagoon-edit::after { content: ""; display: inline-block; width: 1px; height: 1em;
+                        background: #c9d4e3; vertical-align: -2px; margin-left: 1px;
+                        animation: lagoon-blink 1s step-end infinite; }
+  @keyframes lagoon-blink { 50% { opacity: 0; } }
+  body.rebind #chart g.node { filter: drop-shadow(0 0 3px #3b82f6); }
+  body.rebind #chart g.node:hover { filter: drop-shadow(0 0 6px #3b82f6); }
+  #split { flex: 1 1 auto; display: flex; min-height: 0; }
+  #split[hidden] { display: none; }
+  #split iframe { flex: 1 1 50%; border: 0; }
+  #split iframe:not(:last-child) { border-right: 2px solid #3d4759; }
+  body.split-mode #stage, body.split-mode #png, body.split-mode #regen, body.split-mode .flag { display: none; }
+  .flag { font: inherit; color: #9aa7b8; display: flex; align-items: center; gap: 4px; cursor: pointer; }
+  #helpcard { position: absolute; top: 36px; right: 8px; max-width: 620px; z-index: 10; background: #141821;
+              border: 1px solid #3d4759; border-radius: 6px; padding: 10px 14px; font-size: 12px;
+              line-height: 1.6; color: #c9d4e3; box-shadow: 0 6px 24px rgba(0,0,0,.5); }
+  .embedded #tabs { display: none; }
+  .embedded #merge, .embedded #cancel { display: none; }
+</style>
+</head>
+<body>
+<div id="bar"><span id="name">lagoon</span><span id="pos"></span><span id="actions"><button id="undo" hidden title="undo manual layout tweaks (ctrl+z)">undo</button><button id="redo" hidden title="redo (ctrl+shift+z / ctrl+y)">redo</button><button id="reset" hidden title="clear all manual layout tweaks (x)">reset</button><button id="merge" title="pick charts to compare side by side">merge</button><button id="cancel" hidden>cancel</button><button id="png" title="export the whole diagram as PNG (s)">png</button><button id="regen" title="re-render this chart from source, discarding render glitches">regen</button><label class="flag" title="keep mermaid/dagre's original edge routing for this chart instead of the border-anchored swoop"><input type="checkbox" id="legacy">dagre edges</label><button id="help" title="keyboard, drag, and edit reference">?</button></span></div>
+<div id="helpcard" hidden><p><b>tabs</b> — ctrl+tab / ctrl+shift+tab cycle the strip (wrapping, merged tabs included) · 1-8 jump by index, 9 = last · <i>latest</i> = live stream of every push · • = chart changed while away</p><p><b>history</b> — ←/→ walks the current view's versions · Esc: close help → cancel selection → leave merged view → jump to latest</p><p><b>shortcuts</b> — cmd/ctrl+R reset layout · cmd/ctrl+P or s = png · m merge toggle · c copy source · x reset tweaks · 0 or dblclick empty space = fit · +/- zoom · ctrl+z / ctrl+shift+z / ctrl+y undo-redo: layout tweaks first, then falls through to version history so edge edits undo too</p><p><b>drag</b> — 3px arms a drag (clicks never write offsets) · drag a gray cluster to move its members together · double-click a cell for edge edit mode: drag a blue X to re-point that edge, click an X to delete it, drag from the cell body to create a new edge (drop on itself = self-loop) · Esc cancels · every edge edit pushes a new version — undo with ←/→ · refuses chained-edge lines (A --> B --> C) and charts using linkStyle (positional indices would drift)</p><p><b>edges</b> — default: border-anchored swoopy connector between nodes, drawn on first render so dragging never snaps · "dagre edges" per-chart checkbox: mermaid's original routing preserved, stretched affinely on drags · double-click a line's label to edit its text (enter saves, esc cancels, clear-all + enter removes it)</p><p><b>png</b> — whole diagram at 2x to ~/Downloads, [open] button beside the save path · handles/ghosts never export</p><p><b>regen</b> — re-render this chart from source, clearing render glitches without touching history</p></div>
+<div id="tabs"></div>
+<div id="split" hidden></div>
+<div id="stage"><div id="chart"></div><div id="msg" hidden></div></div>
+<script src="mermaid.js"></script>
+<script>
+const $ = (id) => document.getElementById(id);
+const stage = $("stage");
+if (window.self !== window.top) document.body.classList.add("embedded");
+let hist = [];
+let pinned = null;
+let cursor = -1;
+let selecting = false;
+let selection = [];
+let mergedList = [];
+let scale = 1, tx = 0, ty = 0;
+const seenVer = {};
+
+const pinnedName = () => {
+  const h = decodeURIComponent(location.hash.replace(/^#/, ""));
+  return h && h !== "latest" && !h.includes("+") ? h : null;
+};
+const EDGE_OP_RE = /(<-{2,}|-{2,}>|-\.\->|-\.-|==>|={3})/g;
+const EDGE_OP_TEST = new RegExp(EDGE_OP_RE.source);  // /g + .test() advances lastIndex across calls — scans intermittently miss lines
+const SPLIT_RE = /^[A-Za-z0-9._-]+(\+[A-Za-z0-9._-]+)+$/;
+const splitNames = () => {
+  const h = decodeURIComponent(location.hash.replace(/^#/, ""));
+  return SPLIT_RE.test(h) ? h.split("+") : null;
+};
+const viewList = () => (pinned === null ? hist : hist.filter((e) => e.name === pinned));
+const tabNames = () => ["latest", ...new Set(hist.map((e) => e.name)), ...mergedList.map((m) => m.id)];
+
+function show(text) {
+  $("msg").hidden = false;
+  $("msg").textContent = text;
+  $("chart").innerHTML = "";
+  $("pos").textContent = "";
+}
+
+function apply() {
+  $("chart").style.transform = "translate(" + tx + "px," + ty + "px) scale(" + scale + ")";
+}
+
+function fit() {
+  scale = 1; tx = 0; ty = 0; apply();
+  const svg = $("chart").querySelector("svg");
+  if (!svg) return;
+  const st = stage.getBoundingClientRect();
+  const cw = svg.getBoundingClientRect().width || 100;
+  const ch = svg.getBoundingClientRect().height || 100;
+  scale = Math.min((st.width - 24) / cw, (st.height - 24) / ch, 2);
+  tx = (st.width - cw * scale) / 2;
+  ty = (st.height - ch * scale) / 2;
+  apply();
+}
+
+function zoomAt(px, py, factor) {
+  const ns = Math.min(8, Math.max(0.05, scale * factor));
+  tx = px - (px - tx) * (ns / scale);
+  ty = py - (py - ty) * (ns / scale);
+  scale = ns;
+  apply();
+}
+
+function zoomCenter(f) {
+  const r = stage.getBoundingClientRect();
+  zoomAt(r.width / 2, r.height / 2, f);
+}
+
+let offsets = {};
+let legacyEdges = false;  // per-chart escape hatch: keep dagre's routed paths instead of the swoopy cubic
+let curChart = null;
+let layout = null;
+let nodeDrag = null;
+
+const nodeKey = (g) => (g.id.match(/flowchart-(.*)-\d+$/) || [])[1] || g.id;
+const clusterKey = (g) => {
+  const i = g.id.indexOf("-");
+  return i > 0 ? g.id.slice(i + 1) : g.id;
+};
+const armDrag = (ev, st) => Math.abs(ev.clientX - st.x) + Math.abs(ev.clientY - st.y) >= 3;
+const keyOf = (g) => (g.classList.contains("cluster") ? clusterKey(g) : nodeKey(g));
+const offOf = (el) => offsets[keyOf(el)] || [0, 0];
+const totalOffset = (g) => {
+  let x = 0, y = 0, cur = g;
+  while (cur && cur.tagName === "g") {
+    const o = offOf(cur);
+    x += o[0]; y += o[1];
+    cur = cur.parentElement;
+  }
+  return [x, y];
+};
+
+async function loadFlags(name) {
+  try {
+    const o = await (await fetch("/flags/" + encodeURIComponent(name))).json();
+    legacyEdges = !!o.legacyEdges;
+    $("legacy").checked = legacyEdges;
+  } catch (err) { }
+}
+
+async function loadOffsets(name) {
+  offsets = {};
+  try {
+    offsets = await (await fetch("/offsets/" + encodeURIComponent(name))).json();
+  } catch (err) {
+    try {
+      const raw = localStorage.getItem("lagoon-offsets-" + name);
+      if (raw) offsets = JSON.parse(raw);
+    } catch (err2) { }
+  }
+}
+
+function saveOffsets() {
+  if (!curChart) return;
+  try { localStorage.setItem("lagoon-offsets-" + curChart, JSON.stringify(offsets)); } catch (err) { }
+  fetch("/offsets/" + encodeURIComponent(curChart),
+        { method: "POST", body: JSON.stringify(offsets) }).catch(() => { });
+}
+
+const offsetStacks = {};
+function stackOf(name) {
+  if (!offsetStacks[name]) offsetStacks[name] = { stack: [], idx: -1 };
+  return offsetStacks[name];
+}
+function pushOffsetSnapshot() {
+  if (!curChart) return;
+  const s = stackOf(curChart);
+  s.stack = s.stack.slice(0, s.idx + 1);
+  s.stack.push(JSON.stringify(offsets));
+  s.idx = s.stack.length - 1;
+}
+function restoreOffsets(i) {
+  const s = stackOf(curChart);
+  s.idx = i;
+  offsets = JSON.parse(s.stack[i]);
+  applyAll();
+  saveOffsets();
+}
+function undoLayout() {
+  if (splitNames()) return;
+  const s = stackOf(curChart);
+  if (s.idx > 0) restoreOffsets(s.idx - 1);
+  updateLayoutBtns();
+}
+function redoLayout() {
+  if (splitNames()) return;
+  const s = stackOf(curChart);
+  if (s.idx < s.stack.length - 1) restoreOffsets(s.idx + 1);
+  updateLayoutBtns();
+}
+function resetLayout() {
+  if (splitNames()) return;
+  offsets = {};
+  saveOffsets();
+  const s = stackOf(curChart);
+  s.stack = [];
+  s.idx = -1;
+  applyAll();
+  updateLayoutBtns();
+}
+function updateLayoutBtns() {
+  if (splitNames()) { $("reset").hidden = true; $("undo").hidden = true; $("redo").hidden = true; return; }
+  const dirty = Object.keys(offsets).length > 0;
+  const s = curChart ? stackOf(curChart) : null;
+  $("reset").hidden = !dirty;
+  $("undo").hidden = !dirty || !s || s.idx <= 0;
+  $("redo").hidden = !dirty || !s || s.idx >= s.stack.length - 1;
+}
+
+function pathEnds(d) {
+  const n = d.match(/-?[\d.]+/g).map(Number);
+  return [[n[0], n[1]], [n[n.length - 2], n[n.length - 1]]];
+}
+
+function buildLayout() {
+  const svg = $("chart").querySelector("svg");
+  if (!svg) { layout = null; return; }
+  const nodes = [...svg.querySelectorAll("g.node")];
+  const clusters = [...svg.querySelectorAll("g.cluster")];
+  const anchor = new Map();
+  for (const g of nodes) {
+    const m = (g.getAttribute("transform") || "").match(/translate\(\s*(-?[\d.e]+)[ ,]+(-?[\d.e]+)/);
+    anchor.set(g, m ? [+m[1], +m[2]] : [0, 0]);
+  }
+  const nearest = (pt) => {
+    let best = null, bd = Infinity;
+    for (const [g, a] of anchor) {
+      const d = (a[0] - pt[0]) ** 2 + (a[1] - pt[1]) ** 2;
+      if (d < bd) { bd = d; best = g; }
+    }
+    return best;
+  };
+  const labelHost = new Map();
+  const edges = [...svg.querySelectorAll("g.edgePaths path[data-id]")]
+    .filter((p) => p.getAttribute("d"))
+    .map((p) => {
+      const d = p.getAttribute("d");
+      const nums = [];
+      const skel = d.replace(/-?[\d.]+/g, (m) => (nums.push(+m), "\x01" + (nums.length - 1)));
+      const ends = pathEnds(d);
+      return { p, d, skel, nums, src: nearest(ends[0]), tgt: nearest(ends[1]), lbl: null, lblT: null };
+    });
+  // mermaid tags the inner g.label with the edge's own data-id — exact binding,
+  // no geometric guessing (nearby curves steal labels otherwise). The outer
+  // g.edgeLabel holds the position transform; unlabeled edges have none.
+  for (const lab of svg.querySelectorAll("g.edgeLabel g.label[data-id]"))
+    labelHost.set(lab.getAttribute("data-id"), lab.closest("g.edgeLabel"));
+  for (const e of edges) {
+    const host = labelHost.get(e.p.getAttribute("data-id"));
+    if (!host) continue;
+    const m = (host.getAttribute("transform") || "").match(/translate\(\s*(-?[\d.e]+)[ ,]+(-?[\d.e]+)/);
+    if (m) { e.lbl = host; e.lblT = [+m[1], +m[2]]; }
+  }
+  const bbox = new Map();
+  for (const g of nodes) {
+    const shape = [...g.children].find((c) => !["g", "text", "foreignObject"].includes(c.tagName.toLowerCase()));
+    if (shape) { const bb = shape.getBBox(); bbox.set(g, [bb.width / 2, bb.height / 2]); }
+  }
+  const members = new Map();
+  for (const c of clusters) {
+    const r = c.querySelector("rect");
+    if (!r) continue;
+    const cx = +r.getAttribute("x"), cy = +r.getAttribute("y");
+    const cw = +r.getAttribute("width"), ch = +r.getAttribute("height");
+    const list = nodes.filter((g) => {
+      const a = anchor.get(g);
+      return a && a[0] >= cx && a[0] <= cx + cw && a[1] >= cy && a[1] <= cy + ch;
+    });
+    if (list.length) members.set(c, list);
+  }
+  layout = { svg, nodes, clusters, anchor, bbox, edges, members };
+}
+
+function borderPoint(cx, cy, hw, hh, dirx, diry) {
+  // where the center→target line crosses this node's rect
+  return Math.min(hw / Math.abs(dirx || 1e-9), hh / Math.abs(diry || 1e-9));
+}
+
+function affineRemap(nums, s, t) {
+  // legacy-mode drag: stretch the original bezier chain between moved anchors,
+  // preserving dagre's routing shape
+  const n = nums.length;
+  const x0 = nums[0] + s[0], y0 = nums[1] + s[1];
+  const xn = nums[n - 2] + t[0], yn = nums[n - 1] + t[1];
+  const out = nums.slice();
+  const ux = nums[n - 2] - nums[0], uy = nums[n - 1] - nums[1];
+  const L2 = ux * ux + uy * uy || 1;
+  for (let i = 2; i < n - 2; i += 2) {
+    const u = ((nums[i] - nums[0]) * ux + (nums[i + 1] - nums[1]) * uy) / L2;
+    out[i] = x0 + (xn - x0) * u + (nums[i] - (nums[0] + ux * u));
+    out[i + 1] = y0 + (yn - y0) * u + (nums[i + 1] - (nums[1] + uy * u));
+  }
+  out[0] = x0; out[1] = y0; out[n - 2] = xn; out[n - 1] = yn;
+  return out;
+}
+
+function applyEdge(e) {
+  const s = e.src ? totalOffset(e.src) : [0, 0];
+  const t = e.tgt ? totalOffset(e.tgt) : [0, 0];
+  if (legacyEdges) {
+    if (!s[0] && !s[1] && !t[0] && !t[1]) {
+      e.p.setAttribute("d", e.d);
+      if (e.lbl && e.lblT) e.lbl.setAttribute("transform", "translate(" + e.lblT[0] + "," + e.lblT[1] + ")");
+      return;
+    }
+    const out = affineRemap(e.nums, s, t);
+    e.p.setAttribute("d", e.skel.replace(/\x01(\d+)/g, (_, i) => out[+i]));
+    if (e.lbl && e.lblT) e.lbl.setAttribute("transform", "translate(" + (e.lblT[0] + (s[0] + t[0]) / 2) + "," + (e.lblT[1] + (s[1] + t[1]) / 2) + ")");
+    return;
+  }
+  // self-loops (and edges whose endpoints didn't resolve) have no
+  // center-to-center direction to anchor on — keep dagre's loop, translated
+  if (e.src === e.tgt || !e.src || !e.tgt) {
+    const out = e.nums.slice();
+    for (let i = 0; i < out.length; i += 2) { out[i] += s[0]; out[i + 1] += s[1]; }
+    e.p.setAttribute("d", e.skel.replace(/\x01(\d+)/g, (_, i) => out[+i]));
+    if (e.lbl && e.lblT)
+      e.lbl.setAttribute("transform", "translate(" + (e.lblT[0] + s[0]) + "," + (e.lblT[1] + s[1]) + ")");
+    return;
+  }
+  // default: one edge model everywhere — dagre places nodes, we always draw the
+  // border-anchored swoopy cubic, so a first drag moves numbers inside the
+  // same model instead of swapping the whole path shape
+  const a = layout.anchor.get(e.src), b = layout.anchor.get(e.tgt);
+  const sa = layout.bbox.get(e.src) || [40, 20], ba = layout.bbox.get(e.tgt) || [40, 20];
+  const cx0 = a[0] + s[0], cy0 = a[1] + s[1], cxn = b[0] + t[0], cyn = b[1] + t[1];
+  const dx = cxn - cx0, dy = cyn - cy0, L = Math.hypot(dx, dy) || 1;
+  const off0 = borderPoint(cx0, cy0, sa[0], sa[1], dx / L, dy / L);
+  const offn = borderPoint(cxn, cyn, ba[0], ba[1], dx / L, dy / L);
+  const x0 = cx0 + (dx / L) * off0, y0 = cy0 + (dy / L) * off0;
+  const xn = cxn - (dx / L) * offn, yn = cyn - (dy / L) * offn;
+  // one graceful cubic between the border points: control arms along the
+  // dominant axis, so the line swoops instead of zig-zagging
+  let c1x, c1y, c2x, c2y;
+  if (Math.abs(dx) >= Math.abs(dy)) { c1x = x0 + (xn - x0) / 3; c1y = y0; c2x = xn - (xn - x0) / 3; c2y = yn; }
+  else { c1x = x0; c1y = y0 + (yn - y0) / 3; c2x = xn; c2y = yn - (yn - y0) / 3; }
+  e.p.setAttribute("d", "M " + x0 + "," + y0 + " C " + c1x + "," + c1y + " " + c2x + "," + c2y + " " + xn + "," + yn);
+  if (e.lbl && e.lblT)
+    e.lbl.setAttribute("transform", "translate(" + (x0 + 3 * c1x + 3 * c2x + xn) / 8 + "," + (y0 + 3 * c1y + 3 * c2y + yn) / 8 + ")");
+}
+
+
+
+function applyAll() {
+  if (!layout) return;
+  for (const g of layout.nodes) {
+    const a = layout.anchor.get(g);
+    const o = totalOffset(g);
+    g.setAttribute("transform", "translate(" + (a[0] + o[0]) + "," + (a[1] + o[1]) + ")");
+  }
+  for (const g of layout.clusters) {
+    const o = totalOffset(g);
+    if (o[0] || o[1]) g.setAttribute("transform", "translate(" + o[0] + "," + o[1] + ")");
+    else g.removeAttribute("transform");
+  }
+  for (const e of layout.edges) applyEdge(e);
+}
+
+let rebind = null;
+let createDrag = null;
+let ghost = null;
+let labelEdit = null;
+
+function exitRebind() {
+  if (!rebind) return;
+  rebind = null;
+  document.body.classList.remove("rebind");
+  for (const h of [...document.querySelectorAll(".lagoon-handle")]) h.remove();
+}
+
+const escRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+function edgeSourceInfo(edge) {
+  // shared by re-point / delete / label editing: the source line behind a
+  // rendered edge. Returns { e, lines, idx, src, tgt } or an error string.
+  const e = viewList()[cursor];
+  if (!e || e.name !== curChart) return "no source behind this view";
+  const m = (edge.p.getAttribute("data-id") || "").match(/^L_([A-Za-z0-9._-]+)_([A-Za-z0-9._-]+)_(\d+)$/);
+  if (!m) return "can't identify this edge in the source";
+  if (/linkStyle/i.test(e.mmd)) return "this chart uses linkStyle — edge edits disabled (indices would drift)";
+  const lines = e.mmd.split("\n");
+  const matches = [];
+  for (let i = 0; i < lines.length; i++) {
+    const ln = lines[i];
+    if (ln.includes(m[1]) && ln.includes(m[2]) && EDGE_OP_TEST.test(ln)) matches.push(i);
+  }
+  const idx = matches[+m[3]] !== undefined ? matches[+m[3]] : matches[0];
+  if (idx === undefined) return "can't find this edge's source line";
+  if ((lines[idx].match(EDGE_OP_RE) || []).length > 1)
+    return "chained-edge lines can't be edited — split the line first";
+  return { e, lines, idx, src: m[1], tgt: m[2] };
+}
+
+async function rewriteEdge(edge, newTgt) {
+  const info = edgeSourceInfo(edge);
+  if (typeof info === "string") return $("pos").textContent = info;
+  const { e, lines, idx, tgt } = info;
+  const line = lines[idx];
+  if (newTgt === null) {
+    if (line.includes("&")) {
+      if (new RegExp("\\s*&\\s*" + escRe(tgt) + "(?=\\s|$)").test(line))
+        lines[idx] = line.replace(new RegExp("\\s*&\\s*" + escRe(tgt) + "(?=\\s|$)"), "");
+      else if (new RegExp("(^|\\s)" + escRe(tgt) + "\\s*&\\s*").test(line))
+        lines[idx] = line.replace(new RegExp("(^|\\s)" + escRe(tgt) + "\\s*&\\s*"), "$1");
+    } else {
+      lines.splice(idx, 1);
+    }
+  } else {
+    lines[idx] = line.replace(new RegExp("(^|[\\s&])" + escRe(tgt) + "(?=[\\s&|]|$)"), (mm, pre) => pre + newTgt);
+  }
+  try {
+    const r = await fetch("/chart/" + encodeURIComponent(e.name), { method: "POST", body: lines.join("\n") });
+    if (!r.ok) $("pos").textContent = "edge edit failed: HTTP " + r.status;
+  } catch (err) {
+    $("pos").textContent = "edge edit failed: " + String(err);
+  }
+}
+
+async function createEdge(src, tgt) {
+  const e = viewList()[cursor];
+  if (!e || e.name !== curChart) return;
+  if (/linkStyle/i.test(e.mmd)) return $("pos").textContent = "this chart uses linkStyle — edge edits disabled (indices would drift)";
+  const mmd = e.mmd.replace(/\s*$/, "") + "\n" + src + " --> " + tgt;
+  try {
+    const r = await fetch("/chart/" + encodeURIComponent(e.name), { method: "POST", body: mmd });
+    if (!r.ok) $("pos").textContent = "edge create failed: HTTP " + r.status;
+  } catch (err) {
+    $("pos").textContent = "edge create failed: " + String(err);
+  }
+}
+
+function cancelLabelEdit() {
+  if (!labelEdit) return;
+  labelEdit.el.remove();
+  labelEdit = null;
+  $("pos").textContent = "";
+}
+
+async function commitLabelEdit() {
+  const L = labelEdit;
+  if (!L) return;
+  const text = L.text.replace(/\s+$/, "");
+  labelEdit = null;
+  L.el.remove();
+  if (text.includes("|")) { $("pos").textContent = "labels can't contain |"; return; }
+  const info = edgeSourceInfo(L.edge);
+  if (typeof info === "string") { $("pos").textContent = info; return; }
+  const { e, lines, idx } = info;
+  let line = lines[idx];
+  const pipe = /\|[^|]*\|/.test(line);
+  // dash-text forms: A -- text --> B · A -. text .-> B · A == text ==> B
+  const dashTxt = line.match(/--\s+\S.*?\s+-->/) || line.match(/-\.\s+\S.*?\s+\.->/) || line.match(/==\s+\S.*?\s+==>/);
+  if (text === "" && (pipe || dashTxt)) {
+    // cleared: strip the label token entirely
+    line = pipe ? line.replace(/\s*\|[^|]*\|/g, "")
+      : line.replace(dashTxt[0], dashTxt[0].startsWith("--") ? "-->" : dashTxt[0].startsWith("==") ? "==>" : "-.->");
+  } else if (pipe) {
+    line = line.replace(/\|[^|]*\|/, "|" + text + "|");
+  } else if (dashTxt) {
+    line = line.replace(dashTxt[0],
+      dashTxt[0].startsWith("--") ? "-- " + text + " -->"
+      : dashTxt[0].startsWith("==") ? "== " + text + " ==>"
+      : "-. " + text + " .->");
+  } else if (text !== "") {
+    const op = EDGE_OP_TEST.exec(line);  // no label yet: tuck |text| right after the arrow
+    if (!op) { $("pos").textContent = "can't place a label on this line"; return; }
+    line = line.slice(0, op.index + op[0].length) + "|" + text + "|" + line.slice(op.index + op[0].length);
+  }
+  if (line === lines[idx]) { $("pos").textContent = "label unchanged"; return; }
+  lines[idx] = line;
+  try {
+    const r = await fetch("/chart/" + encodeURIComponent(e.name), { method: "POST", body: lines.join("\n") });
+    if (!r.ok) $("pos").textContent = "label edit failed: HTTP " + r.status;
+  } catch (err) {
+    $("pos").textContent = "label edit failed: " + String(err);
+  }
+}
+
+function editEdgeLabel(edge) {
+  cancelLabelEdit();
+  exitRebind();
+  const info = edgeSourceInfo(edge);
+  if (typeof info === "string") { $("pos").textContent = info; return; }
+  const src = info.lines[info.idx];
+  const pipe = src.match(/\|([^|]*)\|/);
+  const dash = src.match(/--\s+(\S.*?)\s+-->/) || src.match(/-\.\s+(\S.*?)\s+\.->/) || src.match(/==\s+(\S.*?)\s+==>/);
+  const pre = pipe ? pipe[1] : dash ? dash[1] : "";
+  const r = edge.lbl.getBoundingClientRect();
+  const sr = stage.getBoundingClientRect();
+  const el = document.createElement("div");
+  el.className = "lagoon-edit";
+  el.textContent = pre;
+  el.style.left = Math.max(4, r.left - sr.left - 16) + "px";
+  el.style.top = Math.max(4, r.top - sr.top - 4) + "px";
+  stage.appendChild(el);
+  labelEdit = { el, text: pre, edge };
+  $("pos").textContent = "enter saves · esc or click away cancels · clear-all + enter removes the label";
+}
+
+function enterRebind(node) {
+  exitRebind();
+  const out = layout ? layout.edges.filter((e) => e.src === node) : [];
+  rebind = { src: node };
+  document.body.classList.add("rebind");
+  $("pos").textContent = out.length
+    ? "drag an X to re-point · click it to delete · drag from this cell to create · Esc cancels"
+    : "no outgoing edges from this cell — drag from it to create one · Esc cancels";
+  const NS = "http://www.w3.org/2000/svg";
+  for (const e of out) {
+    // read the LIVE rendered path start — node offsets have already remapped it,
+    // so the original dagre numbers would put the X at a stale position
+    const live = (e.p.getAttribute("d") || "").match(/-?[\d.]+/g);
+    if (!live) continue;
+    const cx = +live[0], cy = +live[1];
+    // slide outward along the line's first segment so the X sits on the line,
+    // just clear of the node — the grab zone was half-inside the node before
+    const dx = +live[2] - cx, dy = +live[3] - cy;
+    const len = Math.hypot(dx, dy) || 1;
+    const d = Math.min(12, len / 2);
+    const hx = cx + (dx / len) * d, hy = cy + (dy / len) * d;
+    const g = document.createElementNS(NS, "g");
+    g.setAttribute("class", "lagoon-handle");
+    const hit = document.createElementNS(NS, "circle");
+    hit.setAttribute("cx", hx); hit.setAttribute("cy", hy); hit.setAttribute("r", 7);
+    hit.setAttribute("fill", "transparent");
+    hit.setAttribute("pointer-events", "all");
+    const x = document.createElementNS(NS, "path");
+    x.setAttribute("d", "M " + (hx - 5) + " " + (hy - 5) + " L " + (hx + 5) + " " + (hy + 5) + " M " + (hx + 5) + " " + (hy - 5) + " L " + (hx - 5) + " " + (hy + 5));
+    g.appendChild(hit);
+    g.appendChild(x);
+    g.addEventListener("pointerdown", (ev) => {
+      ev.stopPropagation();
+      ev.preventDefault();
+      let moved = false;
+      const onMove = () => { moved = true; };
+      const onUp = async (ev2) => {
+        window.removeEventListener("pointermove", onMove);
+        exitRebind();
+        if (!moved) { await rewriteEdge(e, null); return; }
+        const hit = document.elementFromPoint(ev2.clientX, ev2.clientY);
+        const rec = hit && hit.closest ? hit.closest("g.node") : null;
+        if (rec && layout && layout.svg.contains(rec)) await rewriteEdge(e, nodeKey(rec));
+      };
+      window.addEventListener("pointermove", onMove);
+      window.addEventListener("pointerup", onUp, { once: true });
+    });
+    layout.svg.appendChild(g);
+  }
+}
+
+async function copySource() {
+  if (splitNames()) return;
+  const e = viewList()[cursor];
+  if (!e) return;
+  try {
+    await navigator.clipboard.writeText(e.mmd);
+    $("pos").textContent = "source copied";
+  } catch (err) {
+    $("pos").textContent = "clipboard blocked";
+  }
+}
+
+function deForeign(root) {
+  // WebKit taints the canvas if the drawn SVG contains a foreignObject,
+  // and mermaid v11 emits them for labels even with htmlLabels:false.
+  // Swap each for native <text> with the same lines and box.
+  const NS = "http://www.w3.org/2000/svg";
+  for (const fo of [...root.querySelectorAll("foreignObject")]) {
+    const lines = [];
+    for (const p of fo.querySelectorAll("p")) {
+      for (const seg of p.innerHTML.split(/<br\s*\/?>/i)) {
+        const t = seg.replace(/<[^>]*>/g, "").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&").trim();
+        if (t) lines.push(t);
+      }
+    }
+    if (!lines.length) {
+      const t = fo.textContent.replace(/\s+/g, " ").trim();
+      if (t) lines.push(t);
+    }
+    const w = parseFloat(fo.getAttribute("width")) || 0;
+    const h = parseFloat(fo.getAttribute("height")) || 24;
+    const n = lines.length || 1;
+    const lh = h / n;
+    const cls = fo.querySelector(".nodeLabel") ? "nodeLabel" : fo.querySelector(".edgeLabel") ? "edgeLabel" : "";
+    const g = document.createElementNS(NS, "g");
+    g.setAttribute("class", "label");
+    if (lines.length) {
+      const t = document.createElementNS(NS, "text");
+      if (cls) t.setAttribute("class", cls);
+      t.setAttribute("text-anchor", "middle");
+      lines.forEach((ln, i) => {
+        const ts = document.createElementNS(NS, "tspan");
+        ts.setAttribute("x", w / 2);
+        ts.setAttribute("y", h / 2 + (i - (n - 1) / 2) * lh + 6);
+        ts.textContent = ln;
+        t.appendChild(ts);
+      });
+      g.appendChild(t);
+    }
+    fo.replaceWith(g);
+  }
+}
+
+const topApi = () => (window.pywebview && window.pywebview.api) ||
+  (window.parent !== window && window.parent.pywebview && window.parent.pywebview.api);
+
+function posSaved(path) {
+  const pos = $("pos");
+  pos.textContent = "";
+  const b = document.createElement("button");
+  b.textContent = "open";
+  b.addEventListener("click", async () => { const api = topApi(); if (api) await api.open_file(path); });
+  pos.appendChild(b);
+  pos.appendChild(document.createTextNode("image saved at " + path));
+}
+
+async function exportPng() {
+  if (splitNames()) return;
+  const e = viewList()[cursor];
+  const svg = $("chart").querySelector("svg");
+  if (!e || !svg) return;
+  const clone = svg.cloneNode(true);
+  deForeign(clone);
+  clone.querySelectorAll(".lagoon-handle, .lagoon-ghost").forEach((h) => h.remove());
+  const bb = svg.getBBox();  // live content bounds: dragged elements stay in the export
+  const w = Math.max(bb.width + bb.x * 2, 100), h = Math.max(bb.height + bb.y * 2, 100);
+  clone.setAttribute("viewBox", bb.x + " " + bb.y + " " + bb.width + " " + bb.height);
+  clone.setAttribute("width", w);
+  clone.setAttribute("height", h);
+  clone.removeAttribute("style");
+  const xml = new XMLSerializer().serializeToString(clone);
+  const url = URL.createObjectURL(new Blob([xml], { type: "image/svg+xml" }));
+  try {
+    const img = new Image();
+    await new Promise((res, rej) => { img.onload = res; img.onerror = rej; img.src = url; });
+    const dpr = 2;
+    const cv = document.createElement("canvas");
+    cv.width = Math.ceil(w * dpr);
+    cv.height = Math.ceil(h * dpr);
+    const ctx = cv.getContext("2d");
+    ctx.fillStyle = "#0f1115";
+    ctx.fillRect(0, 0, cv.width, cv.height);
+    ctx.drawImage(img, 0, 0, cv.width, cv.height);
+    const dataUrl = cv.toDataURL("image/png");
+    const fname = "lagoon-" + e.name + "-" + e.ver + ".png";
+    const api = topApi();
+    if (api) {
+      posSaved(await api.save_png(fname, dataUrl));
+    } else {
+      const a = document.createElement("a");
+      a.href = dataUrl; a.download = fname; a.click();
+      $("pos").textContent = "downloaded " + fname;
+    }
+  } catch (err) {
+    show("png export failed: " + String(err));
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+$("png").addEventListener("click", () => exportPng());
+$("regen").addEventListener("click", () => renderEntry(cursor));
+$("help").addEventListener("click", () => { $("helpcard").hidden = !$("helpcard").hidden; });
+document.addEventListener("click", (ev) => { if (!$("helpcard").hidden && !ev.target.closest("#help, #helpcard")) $("helpcard").hidden = true; });
+$("legacy").addEventListener("change", async () => {
+  legacyEdges = $("legacy").checked;
+  try { await fetch("/flags/" + encodeURIComponent(curChart), { method: "POST", body: JSON.stringify({ legacyEdges }) }); } catch (err) { }
+  renderEntry(cursor);
+});
+
+function cycleTabs(shift) {
+  const names = tabNames();
+  const sp = splitNames();
+  const list = viewList();
+  const cur = sp ? sp.join("+")
+    : pinned !== null ? pinned
+    : list[cursor] && cursor < list.length - 1 ? list[cursor].name
+    : "latest";
+  const i = names.indexOf(cur);
+  if (i < 0) { location.hash = "latest"; return; }
+  const j = shift ? (i <= 0 ? names.length - 1 : i - 1) : (i >= names.length - 1 ? 0 : i + 1);
+  location.hash = names[j] === "latest" ? "latest" : names[j];
+}
+
+function updateMergeBtn() {  const m = $("merge");
+  if (splitNames()) { m.textContent = "end merge"; $("cancel").hidden = true; return; }
+  if (selecting) { m.textContent = "merge (" + selection.length + ")"; $("cancel").hidden = false; return; }
+  m.textContent = "merge";
+  $("cancel").hidden = true;
+}
+
+$("merge").addEventListener("click", () => toggleMerge());
+$("cancel").addEventListener("click", () => { selecting = false; renderTabs(); });
+$("undo").addEventListener("click", () => undoLayout());
+$("redo").addEventListener("click", () => redoLayout());
+$("reset").addEventListener("click", () => resetLayout());
+
+async function renderEntry(i) {
+  exitRebind();
+  const list = viewList();
+  cursor = Math.max(0, Math.min(i, list.length - 1));
+  const e = list[cursor];
+  renderTabs();
+  if (!e) {
+    show(pinned ? "no chart '" + pinned + "' yet — push it"
+                : "nothing pushed yet — e.g. lagoon push demo < flow.mmd");
+    $("name").textContent = pinned || "lagoon";
+    return;
+  }
+  seenVer[e.name] = e.ver;
+  $("name").textContent = e.name + " · " + new Date(e.at).toLocaleTimeString() + (pinned ? " · pinned" : "");
+  $("pos").textContent = (cursor + 1) + "/" + list.length;
+  if (typeof mermaid === "undefined")
+    return show("mermaid.js unavailable — not cached and offline; run lagoon serve once while online");
+  try {
+    const out = await mermaid.render("g" + Date.now(), e.mmd);
+    $("msg").hidden = true;
+    $("chart").innerHTML = out.svg || out;
+    const sameChart = curChart === e.name;  // new version of the viewed chart: keep zoom/pan
+    curChart = e.name;
+    loadOffsets(e.name);
+    loadFlags(e.name);
+    buildLayout();
+    applyAll();
+    if (!sameChart) fit();
+  } catch (err) {
+    show(String((err && err.message) || err));
+  }
+}
+
+function renderTabs() {
+  const list = viewList();
+  const viewed = list[cursor];
+  const sp = splitNames();
+  const cur = sp ? sp.join("+")
+    : pinned !== null ? pinned
+    : viewed && cursor < list.length - 1 ? viewed.name
+    : "latest";
+  const names = tabNames();
+  const wrap = $("tabs");
+  wrap.innerHTML = "";
+  for (const n of names) {
+    const t = document.createElement("span");
+    const isMerge = n.includes("+");
+    const lastEntry = hist.filter((e) => e.name === n).at(-1);
+    const unread = !isMerge && n !== "latest" && n !== cur && seenVer[n] !== undefined && lastEntry && lastEntry.ver > seenVer[n];
+    t.className = "tab" + (n === cur ? " active" : "") + (selecting && selection.includes(n) ? " sel" : "");
+    t.textContent = (unread ? "• " : "") + n;
+    t.title = isMerge ? "merged view — right-click to remove" : "";
+    if (selecting) {
+      t.style.opacity = (n === "latest" || isMerge) ? 0.4 : 1;
+      if (n !== "latest" && !isMerge) t.onclick = () => {
+        const i = selection.indexOf(n);
+        if (i >= 0) selection.splice(i, 1); else selection.push(n);
+        renderTabs();
+      };
+    } else {
+      t.onclick = async (ev) => {
+        if (isMerge) { location.hash = n; return; }
+        if ((ev.ctrlKey || ev.metaKey) && n !== "latest") {
+          const curName = pinned || (hist.at(-1) && hist.at(-1).name);
+          if (curName && curName !== n) {
+            location.hash = await registerMerge([curName, n]);
+            return;
+          }
+        }
+        location.hash = n === "latest" ? "latest" : encodeURIComponent(n);
+      };
+      if (isMerge) t.oncontextmenu = (ev) => { ev.preventDefault(); unregisterMerge(n); };
+    }
+    wrap.appendChild(t);
+  }
+  updateMergeBtn();
+  updateLayoutBtns();
+}
+
+async function load() {
+  try {
+    hist = await (await fetch("/history")).json();
+  } catch (err) {
+    setTimeout(load, 1500);  // fetching across a daemon restart window must self-heal
+    return;
+  }
+  await refreshMerges();
+  applyMode();
+}
+
+async function refreshMerges() {
+  try { mergedList = await (await fetch("/merges")).json(); } catch (err) { }
+}
+
+async function registerMerge(names) {
+  try {
+    const r = await fetch("/merges", { method: "POST", body: JSON.stringify({ charts: names }) });
+    const o = await r.json();
+    await refreshMerges();
+    return o.id;
+  } catch (err) { return names.join("+"); }
+}
+
+async function unregisterMerge(id) {
+  try { await fetch("/unmerge", { method: "POST", body: JSON.stringify({ id }) }); } catch (err) { }
+  await refreshMerges();
+  if (splitNames() && splitNames().join("+") === id) location.hash = "latest";
+  else renderTabs();
+}
+
+function applyMode() {
+  const sp = splitNames();
+  if (!sp) {
+    document.body.classList.remove("split-mode");
+    $("split").hidden = true;
+    $("split").innerHTML = "";
+    $("split").dataset.pair = "";
+    pinned = pinnedName();
+    renderEntry(viewList().length - 1);
+    return;
+  }
+  document.body.classList.add("split-mode");
+  $("split").hidden = false;
+  const pair = sp[0] + "+" + sp[1];
+  if ($("split").dataset.pair !== pair) {
+    $("split").dataset.pair = pair;
+    $("split").innerHTML = "";
+    for (const n of sp) {
+      const f = document.createElement("iframe");
+      f.src = "#" + encodeURIComponent(n);
+      $("split").appendChild(f);
+    }
+  }
+  $("name").textContent = sp.join(" | ");
+  $("pos").textContent = sp.length === 2
+    ? "blue = only left · green = only right"
+    : "colored = only in that pane";
+  renderTabs();
+  updateMergeBtn();
+}
+
+const DIFF_COLORS = ["#3b82f6", "#22c55e", "#f59e0b", "#a78bfa", "#f472b6", "#38bdf8"];
+
+function tintDiff() {
+  const frames = [...document.querySelectorAll("#split iframe")];
+  if (frames.length < 2) return;
+  const sets = frames.map((f) => {
+    const ids = new Set();
+    try {
+      for (const g of f.contentDocument.querySelectorAll("svg g.node")) {
+        const m = g.id.match(/flowchart-(.*)-\d+$/);
+        if (m) ids.add(m[1]);
+      }
+    } catch (err) { }
+    return ids;
+  });
+  frames.forEach((f, i) => {
+    let doc;
+    try { doc = f.contentDocument; } catch (err) { return; }
+    if (!doc) return;
+    if (!doc.querySelector("style.lagoon-diff")) {
+      const st = doc.createElement("style");
+      st.className = "lagoon-diff";
+      st.textContent =
+        "g.lagoon-diff-only rect, g.lagoon-diff-only polygon, " +
+        "g.lagoon-diff-only circle, g.lagoon-diff-only path { fill: " +
+        DIFF_COLORS[i % DIFF_COLORS.length] + " !important; }";
+      doc.head.appendChild(st);
+    }
+    const others = sets.filter((_, j) => j !== i);
+    for (const g of doc.querySelectorAll("svg g.node")) {
+      const m = g.id.match(/flowchart-(.*)-\d+$/);
+      if (!m) continue;
+      g.classList.toggle("lagoon-diff-only", others.some((s) => !s.has(m[1])));
+    }
+  });
+}
+setInterval(() => { if (document.body.classList.contains("split-mode")) tintDiff(); }, 1000);
+
+stage.addEventListener("wheel", (ev) => {
+  ev.preventDefault();
+  const r = stage.getBoundingClientRect();
+  if (ev.ctrlKey || ev.metaKey)
+    zoomAt(ev.clientX - r.left, ev.clientY - r.top, Math.exp(-ev.deltaY * 0.01));
+  else { tx -= ev.deltaX; ty -= ev.deltaY; apply(); }
+}, { passive: false });
+
+let drag = null;
+stage.addEventListener("pointerdown", (ev) => {
+  if (labelEdit) {
+    // click away cancels the label editor; clicks on the editor itself do nothing
+    if (!(ev.target.closest && ev.target.closest(".lagoon-edit"))) cancelLabelEdit();
+    return;
+  }
+  const lblHit = ev.target.closest ? ev.target.closest("g.edgeLabel") : null;
+  if (lblHit && layout && layout.svg.contains(lblHit))
+    return;  // labels aren't drag surfaces — no capture taken, so dblclick reaches them (WebKit retargets clicks at capture elements)
+  const hit = layout && ev.target.closest ? ev.target.closest("g.node, g.cluster") : null;
+  if (hit && layout && layout.svg.contains(hit)) {
+    if (rebind) {
+      // in rebind mode the double-clicked cell drags out a NEW edge; other
+      // nodes are receivers only
+      if (hit === rebind.src) createDrag = { x: ev.clientX, y: ev.clientY, pid: ev.pointerId, moved: false };
+      return;
+    }
+    const keys = [keyOf(hit), ...(layout.members.get(hit) || []).map((m) => keyOf(m))];
+    // no pointer capture yet: WebKit retargets click/dblclick at the capture
+    // element, which would make every double-click land on #stage instead of
+    // the node; capture is taken only once a drag arms (pointermove)
+    nodeDrag = { keys, base: keys.map((k) => [...(offsets[k] || [0, 0])]), x: ev.clientX, y: ev.clientY, moved: false, pid: ev.pointerId };
+    stage.classList.add("dragging");
+    return;
+  }
+  drag = { x: ev.clientX, y: ev.clientY, tx: tx, ty: ty };
+  stage.setPointerCapture(ev.pointerId);
+  stage.classList.add("dragging");
+});
+stage.addEventListener("pointermove", (ev) => {
+  if (createDrag) {
+    if (!createDrag.moved) {
+      if (!armDrag(ev, createDrag)) return;
+      createDrag.moved = true;
+      stage.setPointerCapture(createDrag.pid);
+      const NS = "http://www.w3.org/2000/svg";
+      ghost = document.createElementNS(NS, "line");
+      ghost.setAttribute("class", "lagoon-ghost");
+      layout.svg.appendChild(ghost);
+    }
+    const a = layout.anchor.get(rebind.src), o = totalOffset(rebind.src);
+    const sr = stage.getBoundingClientRect();
+    ghost.setAttribute("x1", a[0] + o[0]);
+    ghost.setAttribute("y1", a[1] + o[1]);
+    ghost.setAttribute("x2", (ev.clientX - sr.left - tx) / scale);
+    ghost.setAttribute("y2", (ev.clientY - sr.top - ty) / scale);
+    return;
+  }
+  if (nodeDrag) {
+    if (!nodeDrag.moved) {
+      // clicks jitter a couple px; only become drags past the threshold, so a
+      // double-click never writes a phantom offset or an empty undo snapshot
+      if (!armDrag(ev, nodeDrag)) return;
+      nodeDrag.moved = true;
+      pushOffsetSnapshot();
+      stage.setPointerCapture(nodeDrag.pid);
+    }
+    const dx = (ev.clientX - nodeDrag.x) / scale, dy = (ev.clientY - nodeDrag.y) / scale;
+    nodeDrag.keys.forEach((k, i) => {
+      offsets[k] = [nodeDrag.base[i][0] + dx, nodeDrag.base[i][1] + dy];
+    });
+    applyAll();
+    return;
+  }
+  if (!drag) return;
+  tx = drag.tx + ev.clientX - drag.x;
+  ty = drag.ty + ev.clientY - drag.y;
+  apply();
+});
+const endDrag = (ev) => {
+  if (createDrag) {
+    const c = createDrag;
+    createDrag = null;
+    if (ghost) { ghost.remove(); ghost = null; }
+    if (c.moved && ev && ev.type === "pointerup") {
+      const el = document.elementFromPoint(ev.clientX, ev.clientY);
+      const rec = el && el.closest ? el.closest("g.node") : null;
+      if (rec && layout && layout.svg.contains(rec)) {
+        const src = nodeKey(rebind.src), tgt = nodeKey(rec);
+        exitRebind();
+        createEdge(src, tgt);
+        return;
+      }
+    }
+    return;
+  }
+  if (nodeDrag) {
+    if (nodeDrag.moved) saveOffsets();
+    nodeDrag = null;
+    updateLayoutBtns();
+  }
+  drag = null;
+  stage.classList.remove("dragging");
+};
+stage.addEventListener("pointerup", endDrag);
+stage.addEventListener("pointercancel", endDrag);
+stage.addEventListener("dblclick", (ev) => {
+  const lblHit = ev.target.closest ? ev.target.closest("g.edgeLabel") : null;
+  if (lblHit && layout && layout.svg.contains(lblHit)) {
+    const edge = layout.edges.find((e) => e.lbl === lblHit);
+    if (edge) { ev.stopPropagation(); ev.preventDefault(); editEdgeLabel(edge); return; }
+  }
+  const hit = ev.target.closest ? ev.target.closest("g.node") : null;
+  if (hit && layout && layout.svg.contains(hit)) { ev.stopPropagation(); enterRebind(hit); return; }
+  fit();
+});
+
+const es = new EventSource("/events");
+let esWasDown = false;
+es.onerror = () => { esWasDown = true; };
+es.onopen = () => {
+  if (esWasDown) { location.reload(); return; }
+  load();
+};
+es.onmessage = (ev) => {
+  const obj = JSON.parse(ev.data);
+  if (obj.type === "split") {
+    if (pinned === null && window.self === window.top && !selecting)
+      location.hash = obj.charts.map((n) => encodeURIComponent(n)).join("+");
+    return;
+  }
+  if (obj.type === "merges") { refreshMerges().then(() => renderTabs()); return; }
+  hist.push(obj);
+  if (hist.length > 500) hist.shift();
+  if (splitNames()) return;
+  if (pinned === null || hist[hist.length - 1].name === pinned)
+    renderEntry(viewList().length - 1);
+  else
+    renderTabs();
+};
+addEventListener("hashchange", () => applyMode());
+
+async function toggleMerge() {
+  const sp = splitNames();
+  if (sp) { unregisterMerge(sp.join("+")); return; }
+  if (selecting) {
+    if (selection.length >= 2) {
+      selecting = false;
+      location.hash = await registerMerge(selection);
+    }
+    return;
+  }
+  selecting = true;
+  const e = viewList()[cursor];
+  selection = e ? [e.name] : [];
+  renderTabs();
+}
+
+addEventListener("keydown", (ev) => {
+  if (labelEdit) {
+    // the editor is keyboard-driven (panel keys arrive as synthetic window
+    // events, which a real <input> would never receive) — single source of truth
+    if (ev.key === "Enter") { ev.preventDefault(); commitLabelEdit(); }
+    else if (ev.key === "Escape") { ev.preventDefault(); cancelLabelEdit(); }
+    else if (ev.key === "Backspace") {
+      ev.preventDefault();
+      labelEdit.text = labelEdit.text.slice(0, -1);
+      labelEdit.el.textContent = labelEdit.text;
+    } else if (ev.key.length === 1 && !ev.metaKey && !ev.ctrlKey && !ev.altKey) {
+      ev.preventDefault();
+      labelEdit.text += ev.key;
+      labelEdit.el.textContent = labelEdit.text;
+    }
+    return;
+  }
+  if (ev.key === "Escape") {
+    if (!$("helpcard").hidden) { $("helpcard").hidden = true; return; }
+    if (rebind) { exitRebind(); $("pos").textContent = ""; return; }
+    if (selecting) { selecting = false; renderTabs(); return; }
+    if (splitNames()) { location.hash = "latest"; return; }
+    if (viewList().length) renderEntry(viewList().length - 1);
+    return;
+  }
+  if (selecting) return;
+  if (/^[1-9]$/.test(ev.key)) {
+    ev.preventDefault();
+    const names = tabNames();
+    const idx = ev.key === "9" ? names.length - 1 : Number(ev.key) - 1;
+    const n = names[idx];
+    if (n) location.hash = n === "latest" ? "latest" : n;
+    return;
+  }
+  if (ev.ctrlKey && ev.key === "Tab") {
+    ev.preventDefault();
+    cycleTabs(ev.shiftKey);
+    return;
+  }
+  const meta = ev.metaKey || ev.ctrlKey;  // cmd on macOS, ctrl on Linux/GTK
+  if (meta && (ev.key === "r" || ev.key === "R")) { ev.preventDefault(); resetLayout(); return; }
+  if (meta && (ev.key === "p" || ev.key === "P")) { ev.preventDefault(); exportPng(); return; }
+  if ((ev.key === "m" || ev.key === "M") && !meta) { toggleMerge(); return; }
+  if (splitNames()) return;
+  if (meta && (ev.key === "z" || ev.key === "y")) {
+    // offset-undo first; when the layout stack is exhausted, fall through to
+    // walking this chart's version history, so ctrl+z also undoes edge edits
+    const s = curChart ? stackOf(curChart) : null;
+    const list = viewList();
+    if (ev.key === "y" || (ev.key === "z" && ev.shiftKey)) {
+      if (s && s.idx < s.stack.length - 1) redoLayout();
+      else if (cursor < list.length - 1) { ev.preventDefault(); renderEntry(cursor + 1); }
+    } else {
+      if (s && s.idx > 0) undoLayout();
+      else if (cursor > 0) { ev.preventDefault(); renderEntry(cursor - 1); }
+    }
+    return;
+  }
+  const list = viewList();
+  if (ev.key === "ArrowLeft" && cursor > 0) { ev.preventDefault(); renderEntry(cursor - 1); }
+  else if (ev.key === "ArrowRight" && cursor < list.length - 1) { ev.preventDefault(); renderEntry(cursor + 1); }
+  else if (ev.key === "+" || ev.key === "=") zoomCenter(1.25);
+  else if (ev.key === "-") zoomCenter(0.8);
+  else if (ev.key === "0") fit();
+  else if (ev.key === "s") exportPng();
+  else if (ev.key === "c") copySource();
+  else if (ev.key === "x") resetLayout();
+});
+
+if (window.mermaid)
+  mermaid.initialize({ startOnLoad: false, theme: "dark", securityLevel: "strict",
+                       flowchart: { useMaxWidth: false, htmlLabels: false },
+                       sequence: { useMaxWidth: false } });
+</script>
+</body>
+</html>
+"""
+
+
+def utcnow():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def bad_name(name):
+    return not NAME_RE.match(name) or name == "latest"
+
+
+def ensure_mermaid():
+    p = DIR / "mermaid.js"
+    if p.exists() and p.stat().st_size > 100_000:
+        return p
+    for url in MERMAID_URLS:
+        try:
+            with urllib.request.urlopen(url, timeout=20) as r:
+                data = r.read()
+            if len(data) < 100_000:
+                continue
+            tmp = p.with_suffix(".tmp")
+            tmp.write_bytes(data)
+            os.replace(tmp, p)
+            return p
+        except OSError:
+            continue
+    return None
+
+
+class Store:
+    def __init__(self):
+        self.path = DIR / "history.jsonl"
+        self.hist = []
+        if self.path.exists():
+            for line in self.path.read_text().splitlines():
+                with contextlib.suppress(json.JSONDecodeError):
+                    e = json.loads(line)
+                    if isinstance(e, dict) and "mmd" in e:
+                        self.hist.append(e)
+        self.next_ver = (self.hist[-1]["ver"] + 1) if self.hist else 0
+        self.merges_path = DIR / "merges.json"
+        self.merges = []
+        if self.merges_path.exists():
+            with contextlib.suppress(json.JSONDecodeError):
+                data = json.loads(self.merges_path.read_text())
+                if isinstance(data, list):
+                    self.merges = [
+                        m for m in data
+                        if isinstance(m, dict) and isinstance(m.get("id"), str)
+                        and isinstance(m.get("charts"), list)
+                    ]
+
+    def register_merge(self, names):
+        mid = "+".join(names)
+        if not any(m["id"] == mid for m in self.merges):
+            self.merges.append({"id": mid, "charts": list(names)})
+            self.merges_path.write_text(json.dumps(self.merges))
+        return mid
+
+    def unregister_merge(self, mid):
+        before = len(self.merges)
+        self.merges = [m for m in self.merges if m["id"] != mid]
+        if len(self.merges) != before:
+            self.merges_path.write_text(json.dumps(self.merges))
+            return True
+        return False
+
+    def append(self, name, mmd):
+        entry = {"ver": self.next_ver, "name": name, "mmd": mmd, "at": utcnow()}
+        self.next_ver += 1
+        self.hist.append(entry)
+        (DIR / "charts" / f"{name}.mmd").write_text(mmd)
+        if len(self.hist) > HIST_KEEP:
+            self.hist = self.hist[-HIST_KEEP * 4 // 5:]
+            self.path.write_text("".join(json.dumps(e) + "\n" for e in self.hist))
+        else:
+            with self.path.open("a") as f:
+                f.write(json.dumps(entry) + "\n")
+        return entry
+
+
+async def read_body(reader, headers):
+    try:
+        n = int(headers.get("content-length", "0"))
+        return json.loads(await asyncio.wait_for(reader.readexactly(n), timeout=15) if n else b"{}")
+    except (ValueError, asyncio.TimeoutError, asyncio.IncompleteReadError):
+        return None
+
+
+def reply_json(writer, obj):
+    return reply(writer, "200 OK", "application/json", json.dumps(obj))
+
+
+async def reply(writer, status, ctype, body):
+    if isinstance(body, str):
+        body = body.encode()
+    writer.write(
+        f"HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode()
+        + body
+    )
+    await writer.drain()
+
+
+class Daemon:
+    def __init__(self):
+        self.store = Store()
+        self.clients = set()
+
+    async def broadcast(self, entry):
+        for q in list(self.clients):
+            with contextlib.suppress(asyncio.QueueFull):
+                q.put_nowait(entry)
+
+    async def handle_sock(self, reader, writer):
+        try:
+            data = await asyncio.wait_for(reader.read(), timeout=60)
+            head, _, body = data.decode("utf-8", "replace").partition("\n")
+            parts = head.split()
+            body = body.strip("\n")
+            if not parts:
+                resp = {"ok": False, "error": "empty request"}
+            elif parts[0] == "push":
+                if len(parts) > 1 and bad_name(parts[1]):
+                    resp = {"ok": False, "error": "bad name"}
+                elif not body.strip():
+                    resp = {"ok": False, "error": "no mermaid payload"}
+                else:
+                    name = parts[1] if len(parts) > 1 else "scratch"
+                    entry = self.store.append(name, body)
+                    await self.broadcast(entry)
+                    resp = {"ok": True, "name": entry["name"], "ver": entry["ver"], "at": entry["at"]}
+            elif parts[0] == "show":
+                name = parts[1] if len(parts) > 1 else ""
+                chart = DIR / "charts" / f"{name}.mmd"
+                if not NAME_RE.match(name) or not chart.exists():
+                    resp = {"ok": False, "error": f"no chart {name!r}"}
+                else:
+                    entry = self.store.append(name, chart.read_text())
+                    await self.broadcast(entry)
+                    resp = {"ok": True, "name": entry["name"], "ver": entry["ver"], "at": entry["at"]}
+            elif parts[0] in ("compare", "merge"):
+                names = parts[1:]
+                if len(names) < 2 or any(not NAME_RE.match(n) for n in names):
+                    resp = {"ok": False, "error": "compare needs 2+ valid chart names"}
+                else:
+                    mid = self.store.register_merge(names)
+                    await self.broadcast({"type": "merges"})
+                    if parts[0] == "compare":
+                        await self.broadcast({"type": "split", "charts": names})
+                    resp = {"ok": True, "id": mid, "charts": names, "panels": len(self.clients)}
+            elif parts[0] == "unmerge":
+                mid = parts[1] if len(parts) > 1 else ""
+                if self.store.unregister_merge(mid):
+                    await self.broadcast({"type": "merges"})
+                    resp = {"ok": True, "removed": mid}
+                else:
+                    resp = {"ok": False, "error": f"no merged view {mid!r}"}
+            elif parts[0] == "offsets":
+                name = parts[1] if len(parts) > 1 else ""
+                if not NAME_RE.match(name):
+                    resp = {"ok": False, "error": "bad name"}
+                else:
+                    f = DIR / "charts" / f"{name}.offsets.json"
+                    resp = {"ok": True, "offsets": json.loads(f.read_text()) if f.exists() else {}}
+            elif parts[0] == "history":
+                name = parts[1] if len(parts) > 1 else None
+                if name and not NAME_RE.match(name):
+                    resp = {"ok": False, "error": "bad name"}
+                else:
+                    src = self.store.hist if name is None else [e for e in self.store.hist if e["name"] == name]
+                    entries = [{k: e[k] for k in ("ver", "name", "at")} for e in src][-50:]
+                    resp = {"ok": True, "entries": entries}
+            elif parts[0] == "list":
+                resp = {
+                    "ok": True,
+                    "charts": sorted(p.stem for p in (DIR / "charts").glob("*.mmd")),
+                    "current": self.store.hist[-1]["name"] if self.store.hist else None,
+                    "merges": [m["id"] for m in self.store.merges],
+                }
+            else:
+                resp = {"ok": False, "error": f"unknown command {parts[0]!r}"}
+            writer.write((json.dumps(resp) + "\n").encode())
+            await writer.drain()
+        except (OSError, asyncio.TimeoutError):
+            pass
+        finally:
+            with contextlib.suppress(Exception):
+                writer.close()
+
+    async def handle_http(self, reader, writer):
+        try:
+            first = b""
+            headers = {}
+            for _ in range(100):
+                line = await asyncio.wait_for(reader.readline(), timeout=15)
+                if not line or line in (b"\r\n", b"\n"):
+                    break
+                if first == b"" and line:
+                    first = line
+                else:
+                    k, _, v = line.decode("latin-1").partition(":")
+                    headers[k.strip().lower()] = v.strip()
+            parts = first.decode("latin-1").split()
+            method, path = (parts[0].upper(), parts[1].split("?", 1)[0]) if len(parts) >= 2 else ("", "")
+            if method == "POST" and path.startswith("/flags/"):
+                name = path[len("/flags/"):]
+                if bad_name(name):
+                    return await reply(writer, "400 Bad Request", "text/plain", "bad name")
+                obj = await read_body(reader, headers)
+                if obj is None or not isinstance(obj, dict):
+                    return await reply(writer, "400 Bad Request", "text/plain", "bad flags")
+                (DIR / "charts" / f"{name}.flags.json").write_text(json.dumps(obj))
+                return await reply_json(writer, {"ok": True})
+            if method == "POST" and path.startswith("/offsets/"):
+                name = path[len("/offsets/"):]
+                if bad_name(name):
+                    return await reply(writer, "400 Bad Request", "text/plain", "bad name")
+                obj = await read_body(reader, headers)
+                if obj is None or not isinstance(obj, dict):
+                    return await reply(writer, "400 Bad Request", "text/plain", "bad offsets")
+                (DIR / "charts" / f"{name}.offsets.json").write_text(json.dumps(obj))
+                return await reply(writer, "200 OK", "application/json", '{"ok": true}')
+            if method == "POST" and path.startswith("/chart/"):
+                name = path[len("/chart/"):]
+                if bad_name(name):
+                    return await reply(writer, "400 Bad Request", "text/plain", "bad name")
+                try:
+                    n = int(headers.get("content-length", "0"))
+                    data = await asyncio.wait_for(reader.readexactly(n), timeout=15) if n else b""
+                except (ValueError, asyncio.TimeoutError, asyncio.IncompleteReadError):
+                    return await reply(writer, "400 Bad Request", "text/plain", "bad body")
+                mmd = data.decode("utf-8", "replace").strip("\n")
+                if not mmd.strip():
+                    return await reply(writer, "400 Bad Request", "text/plain", "no mermaid payload")
+                entry = self.store.append(name, mmd)
+                await self.broadcast(entry)
+                return await reply(
+                    writer, "200 OK", "application/json",
+                    json.dumps({"ok": True, "name": entry["name"], "ver": entry["ver"]}),
+                )
+            if method == "POST" and path == "/merges":
+                obj = await read_body(reader, headers)
+                if obj is None:
+                    return await reply(writer, "400 Bad Request", "text/plain", "bad body")
+                charts = obj.get("charts") if isinstance(obj, dict) else None
+                if (
+                    not isinstance(charts, list) or len(charts) < 2
+                    or any(not isinstance(c, str) or not NAME_RE.match(c) for c in charts)
+                ):
+                    return await reply(writer, "400 Bad Request", "text/plain", "charts must be 2+ valid names")
+                mid = self.store.register_merge(charts)
+                await self.broadcast({"type": "merges"})
+                return await reply_json(writer, {"ok": True, "id": mid})
+            if method == "POST" and path == "/unmerge":
+                obj = await read_body(reader, headers)
+                if obj is None:
+                    return await reply(writer, "400 Bad Request", "text/plain", "bad body")
+                mid = obj.get("id") if isinstance(obj, dict) else None
+                if not isinstance(mid, str) or not self.store.unregister_merge(mid):
+                    return await reply(writer, "404 Not Found", "text/plain", "no such merged view")
+                await self.broadcast({"type": "merges"})
+                return await reply(writer, "200 OK", "application/json", '{"ok": true}')
+            if method != "GET":
+                return await reply(writer, "405 Method Not Allowed", "text/plain", "GET only")
+            if path == "/":
+                return await reply(writer, "200 OK", "text/html; charset=utf-8", PAGE)
+            if path == "/history":
+                return await reply_json(writer, self.store.hist)
+            if path == "/current":
+                return await reply(
+                    writer, "200 OK", "application/json",
+                    json.dumps(self.store.hist[-1] if self.store.hist else None),
+                )
+            if path == "/mermaid.js":
+                p = await asyncio.get_running_loop().run_in_executor(None, ensure_mermaid)
+                if p is None:
+                    return await reply(
+                        writer, "503 Service Unavailable", "text/plain",
+                        "mermaid.js not cached and download failed",
+                    )
+                return await reply(writer, "200 OK", "application/javascript", p.read_bytes())
+            if path.startswith("/chart/"):
+                name = path[len("/chart/"):]
+                chart = DIR / "charts" / f"{name}.mmd"
+                if not NAME_RE.match(name) or not chart.exists():
+                    return await reply(writer, "404 Not Found", "text/plain", "no such chart")
+                return await reply(writer, "200 OK", "text/plain; charset=utf-8", chart.read_text())
+            if path.startswith("/flags/"):
+                name = path[len("/flags/"):]
+                f = DIR / "charts" / f"{name}.flags.json"
+                if bad_name(name):
+                    return await reply(writer, "400 Bad Request", "text/plain", "bad name")
+                return await reply(writer, "200 OK", "application/json", f.read_text() if f.exists() else "{}")
+            if path.startswith("/offsets/"):
+                name = path[len("/offsets/"):]
+                f = DIR / "charts" / f"{name}.offsets.json"
+                if bad_name(name):
+                    return await reply(writer, "400 Bad Request", "text/plain", "bad name")
+                return await reply(writer, "200 OK", "application/json", f.read_text() if f.exists() else "{}")
+            if path == "/merges":
+                return await reply(writer, "200 OK", "application/json", json.dumps(self.store.merges))
+            if path == "/events":
+                q = asyncio.Queue(maxsize=20)
+                self.clients.add(q)
+                writer.write(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+                    b"Cache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n"
+                )
+                await writer.drain()
+                try:
+                    while True:
+                        entry = await q.get()
+                        writer.write(("data: " + json.dumps(entry) + "\n\n").encode())
+                        await writer.drain()
+                finally:
+                    self.clients.discard(q)
+                    with contextlib.suppress(OSError):
+                        writer.close()
+                return
+            await reply(writer, "404 Not Found", "text/plain", "nope")
+        except (OSError, asyncio.TimeoutError, asyncio.IncompleteReadError):
+            pass
+        finally:
+            with contextlib.suppress(Exception):
+                writer.close()
+
+    async def fs_poll(self):
+        inbox = DIR / "current.mmd"
+        try:
+            st = inbox.stat()
+            seen = (st.st_mtime_ns, st.st_size)
+        except OSError:
+            seen = None
+        while True:
+            await asyncio.sleep(0.4)
+            try:
+                st = inbox.stat()
+            except OSError:
+                continue
+            key = (st.st_mtime_ns, st.st_size)
+            if key == seen:
+                continue
+            seen = key
+            mmd = inbox.read_text().strip()
+            if mmd and (not self.store.hist or self.store.hist[-1]["mmd"] != mmd):
+                entry = self.store.append("scratch", mmd)
+                await self.broadcast(entry)
+
+    async def run(self):
+        if SOCK.exists():
+            SOCK.unlink()
+        sock_srv = await asyncio.start_unix_server(self.handle_sock, str(SOCK))
+        http_srv = await asyncio.start_server(self.handle_http, "127.0.0.1", PORT)
+        poll = asyncio.create_task(self.fs_poll())
+        print(f"lagoon: socket {SOCK}  http://127.0.0.1:{PORT}/", flush=True)
+        try:
+            await asyncio.Event().wait()
+        finally:
+            poll.cancel()
+            sock_srv.close()
+            http_srv.close()
+            with contextlib.suppress(OSError):
+                SOCK.unlink()
+
+
+APP_PLIST = """<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleName</key><string>Lagoon</string>
+  <key>CFBundleDisplayName</key><string>Lagoon</string>
+  <key>CFBundleIdentifier</key><string>com.leslie.lagoon</string>
+  <key>CFBundleVersion</key><string>1</string>
+  <key>CFBundleShortVersionString</key><string>1.0</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleExecutable</key><string>lagoon-panel</string>
+  <key>CFBundleIconFile</key><string>lagoon</string>
+  <key>CFBundleDevelopmentRegion</key><string>en</string>
+  <key>NSHighResolutionCapable</key><true/>
+  <key>LSMinimumSystemVersion</key><string>11.0</string>
+</dict>
+</plist>
+"""
+
+
+def icon_pdf():
+    def rr(x0, y0, x1, y1, r):
+        k = 0.5523 * r
+        return (
+            f"{x0+r:.1f} {y0:.1f} m "
+            f"{x1-r:.1f} {y0:.1f} l "
+            f"{x1-r+k:.1f} {y0:.1f} {x1:.1f} {y0+r-k:.1f} {x1:.1f} {y0+r:.1f} c "
+            f"{x1:.1f} {y1-r+k:.1f} {x1-r+k:.1f} {y1:.1f} {x1-r:.1f} {y1:.1f} c "
+            f"{x0+r:.1f} {y1:.1f} l "
+            f"{x0+r-k:.1f} {y1:.1f} {x0:.1f} {y1-r+k:.1f} {x0:.1f} {y1-r:.1f} c "
+            f"{x0:.1f} {y0+r-k:.1f} {x0+r-k:.1f} {y0:.1f} {x0+r:.1f} {y0:.1f} c h"
+        )
+
+    def circle(cx, cy, r):
+        k = 0.5523 * r
+        return (
+            f"{cx:.1f} {cy+r:.1f} m "
+            f"{cx+k:.1f} {cy+r:.1f} {cx+r:.1f} {cy+k:.1f} {cx+r:.1f} {cy:.1f} c "
+            f"{cx+r:.1f} {cy-k:.1f} {cx+k:.1f} {cy-r:.1f} {cx:.1f} {cy-r:.1f} c "
+            f"{cx-k:.1f} {cy-r:.1f} {cx-r:.1f} {cy-k:.1f} {cx-r:.1f} {cy:.1f} c "
+            f"{cx-r:.1f} {cy+k:.1f} {cx-k:.1f} {cy+r:.1f} {cx:.1f} {cy+r:.1f} c h"
+        )
+
+    teal = "0.204 0.831 0.714"
+    light = "0.906 0.929 0.953"
+    stream = " ".join([
+        "q",
+        rr(72, 72, 952, 952, 200), "0.059 0.086 0.125 rg f W n",
+        rr(180, 520, 430, 680, 30), light + " rg f",
+        rr(600, 120, 850, 280, 30), light + " rg f",
+        "430 600 m 560 600 500 320 660 292 c " + teal + " RG 26 w 1 J 1 j S",
+        "700 292 m 654 318 l 656 264 l h " + teal + " rg f",
+        circle(750, 560, 54), teal + " rg f",
+        "Q",
+    ])
+    objs = [
+        "<< /Type /Catalog /Pages 2 0 R >>",
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 1024 1024] /Contents 4 0 R /Resources << >> >>",
+        f"<< /Length {len(stream.encode())} >>\nstream\n{stream}\nendstream",
+    ]
+    out = bytearray(b"%PDF-1.4\n")
+    offsets = []
+    for i, body in enumerate(objs, 1):
+        offsets.append(len(out))
+        out += f"{i} 0 obj\n{body}\nendobj\n".encode()
+    xref = len(out)
+    out += f"xref\n0 {len(objs)+1}\n0000000000 65535 f \n".encode()
+    for off in offsets:
+        out += f"{off:010d} 00000 n \n".encode()
+    out += f"trailer\n<< /Size {len(objs)+1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF".encode()
+    return bytes(out)
+
+
+LAUNCHER_C = """
+#include <stdlib.h>
+#include <stdio.h>
+#include <unistd.h>
+int main(int argc, char **argv) {
+    const char *home = getenv("HOME");
+    if (!home) return 1;
+    char py[4096], lg[4096];
+    snprintf(py, sizeof py, "%s/.local/state/lagoon/venv/bin/python", home);
+    snprintf(lg, sizeof lg, "%s/.local/bin/lagoon", home);
+    char **a = calloc(argc + 3, sizeof(char *));
+    if (!a) return 1;
+    a[0] = py; a[1] = lg; a[2] = "_panel";
+    for (int i = 1; i < argc; i++) a[i + 2] = argv[i];
+    execv(py, a);
+    perror("execv");
+    return 127;
+}
+"""
+
+
+def make_app_bundle():
+    app = Path.home() / "Applications" / "Lagoon.app"
+    mac = app / "Contents" / "MacOS"
+    res = app / "Contents" / "Resources"
+    mac.mkdir(parents=True, exist_ok=True)
+    res.mkdir(parents=True, exist_ok=True)
+    exe = mac / "lagoon-panel"
+    (app / "Contents" / "Info.plist").write_text(APP_PLIST)
+    src = res / "launcher.c"
+    src.write_text(LAUNCHER_C)
+    # LaunchServices on recent macOS will not exec shell-script bundle executables
+    r = subprocess.run(["cc", "-O2", "-o", str(exe), str(src)], capture_output=True)
+    if r.returncode != 0:
+        r = subprocess.run(["clang", "-O2", "-o", str(exe), str(src)], capture_output=True)
+    if r.returncode != 0:
+        exe.write_text(
+            "#!/bin/sh\n"
+            'exec "$HOME/.local/state/lagoon/venv/bin/python" "$HOME/.local/bin/lagoon" _panel "$@"\n'
+        )
+        exe.chmod(0o755)
+    icns = res / "lagoon.icns"
+    if not icns.exists():
+        pdf = res / "lagoon.pdf"
+        pdf.write_bytes(icon_pdf())
+        master = res / "lagoon-1024.png"
+        subprocess.run(
+            ["sips", "-s", "format", "png", "-z", "1024", "1024", str(pdf), "--out", str(master)],
+            check=True, capture_output=True,
+        )
+        iconset = res / "lagoon.iconset"
+        iconset.mkdir(exist_ok=True)
+        for s in (16, 32, 128, 256, 512):
+            for suffix, dim in (("", s), ("@2x", s * 2)):
+                subprocess.run(
+                    ["sips", "-s", "format", "png", "-z", str(dim), str(dim), str(master), "--out",
+                     str(iconset / f"icon_{s}x{s}{suffix}.png")],
+                    check=True, capture_output=True,
+                )
+        subprocess.run(
+            ["iconutil", "-c", "icns", str(iconset), "-o", str(icns)],
+            check=True, capture_output=True,
+        )
+        shutil.rmtree(iconset, ignore_errors=True)
+        pdf.unlink(missing_ok=True)
+        master.unlink(missing_ok=True)
+    return app
+
+
+def daemon_running():
+    try:
+        with socket.socket(socket.AF_UNIX) as s:
+            s.settimeout(0.5)
+            s.connect(str(SOCK))
+            s.sendall(b"list\n")
+            s.shutdown(socket.SHUT_WR)
+            return bool(s.recv(4096))
+    except OSError:
+        return False
+
+
+def sock_request(payload):
+    try:
+        with socket.socket(socket.AF_UNIX) as s:
+            s.settimeout(10)
+            s.connect(str(SOCK))
+            s.sendall(payload.encode())
+            s.shutdown(socket.SHUT_WR)
+            buf = b""
+            while chunk := s.recv(65536):
+                buf += chunk
+    except OSError:
+        sys.exit("lagoon: daemon not running — start it with: lagoon panel (or lagoon serve)")
+    with contextlib.suppress(json.JSONDecodeError):
+        return json.loads(buf)
+    sys.exit(f"lagoon: bad response: {buf[:200]!r}")
+
+
+def ensure_daemon():
+    if daemon_running():
+        return
+    DIR.mkdir(parents=True, exist_ok=True)
+    log = open(DIR / "serve.log", "ab")
+    subprocess.Popen(
+        [sys.executable, os.path.abspath(__file__), "serve"],
+        start_new_session=True,
+        stdin=subprocess.DEVNULL,
+        stdout=log,
+        stderr=log,
+    )
+    log.close()
+    deadline = time.monotonic() + 8
+    while time.monotonic() < deadline:
+        if daemon_running():
+            return
+        time.sleep(0.1)
+    sys.exit(f"lagoon: daemon did not start — see {DIR / 'serve.log'}")
+
+
+def panel_python():
+    venv = DIR / "venv"
+    py = venv / "bin" / "python"
+    if py.exists():
+        r = subprocess.run([str(py), "-c", "import webview"], capture_output=True)
+        if r.returncode == 0:
+            return py
+    venv.mkdir(parents=True, exist_ok=True)
+    base = sys.executable
+    if sys.platform == "darwin":
+        # non-framework pythons leak keyboard focus to other apps (pywebview FAQ)
+        for cand in ("/opt/homebrew/bin/python3", "/usr/local/bin/python3"):
+            try:
+                out = subprocess.run(
+                    [cand, "-c", "import sysconfig; print(sysconfig.get_config_var('PYTHONFRAMEWORK') or '')"],
+                    capture_output=True, text=True,
+                )
+            except OSError:
+                continue
+            if out.returncode == 0 and out.stdout.strip():
+                base = cand
+                break
+    subprocess.run([base, "-m", "venv", str(venv)], check=True)
+    subprocess.run(
+        [str(py), "-m", "pip", "install", "--quiet", "--disable-pip-version-check", "pywebview"],
+        check=True,
+    )
+    return py
+
+
+def cmd_serve(args):
+    if daemon_running():
+        print("lagoon: already running")
+        return
+    DIR.mkdir(parents=True, exist_ok=True)
+    (DIR / "charts").mkdir(exist_ok=True)
+    try:
+        asyncio.run(Daemon().run())
+    except OSError as e:
+        sys.exit(f"lagoon: cannot start: {e}")
+    except KeyboardInterrupt:
+        pass
+
+
+def cmd_panel(args):
+    for n in args.names:
+        if bad_name(n):
+            sys.exit("lagoon: names are [A-Za-z0-9._-], up to 64 chars ('latest' is reserved)")
+    ensure_daemon()
+    if len(args.names) >= 2:
+        with contextlib.suppress(SystemExit):
+            sock_request("merge " + " ".join(args.names) + "\n")
+    py = panel_python()
+    if sys.platform == "darwin" and not os.environ.get("LAGOON_DIR") and not os.environ.get("LAGOON_PORT"):
+        app = make_app_bundle()
+        subprocess.run(["open", "-n", "-a", str(app), "--args", *args.names], check=True)
+        return
+    r = subprocess.run([str(py), os.path.abspath(__file__), "_panel", *args.names])
+    sys.exit(r.returncode)
+
+
+class PanelApi:
+    def save_png(self, fname, data_url):
+        if not re.fullmatch(r"lagoon-[A-Za-z0-9._-]+-\d+\.png", fname):
+            fname = f"lagoon-{int(time.time())}.png"
+        out = Path.home() / "Downloads"
+        out.mkdir(parents=True, exist_ok=True)
+        out = out / fname
+        out.write_bytes(base64.b64decode(data_url.partition(",")[2]))
+        return str(out)
+
+    def open_file(self, path):
+        p = Path(path)
+        if p.suffix != ".png" or p.parent != Path.home() / "Downloads" or not p.is_file():
+            return False
+        subprocess.Popen(["open" if sys.platform == "darwin" else "xdg-open", str(p)])
+        return True
+
+
+KEYCODES = {
+    # Primary map: macOS virtual keycodes. charactersIgnoringModifiers lies
+    # under modifiers (shift+tab reports backtab \x19, not \t), but the raw
+    # keycode is stable for every key the page cares about.
+    123: "ArrowLeft", 124: "ArrowRight", 125: "ArrowDown", 126: "ArrowUp",
+    48: "Tab", 36: "Enter", 76: "Enter", 53: "Escape",
+    51: "Backspace", 49: " ", 117: "Delete",
+    115: "Home", 119: "End", 116: "PageUp", 121: "PageDown",
+}
+KEY_MAP = {
+    # Fallback for printable keys via charactersIgnoringModifiers.
+    # AppKit function-key unichars: F700=up F701=down F702=left F703=right
+    # F728=Delete F729=Home F72B=End F72C=PageUp F72D=PageDown.
+    "": "ArrowUp", "": "ArrowDown",
+    "": "ArrowLeft", "": "ArrowRight",
+    "": "Home", "": "End",
+    "": "PageUp", "": "PageDown",
+    "": "Delete",
+    "\x19": "Tab", "\t": "Tab", "\r": "Enter", "\x03": "Enter",
+    "\x1b": "Escape", "\x08": "Backspace", " ": " ",
+}
+
+
+def find_webview(win):
+    try:
+        import WebKit
+    except ImportError:
+        return None
+    stack = [win.contentView()]
+    while stack:
+        v = stack.pop()
+        if v is None:
+            continue
+        if v.isKindOfClass_(WebKit.WKWebView):
+            return v
+        stack.extend(list(v.subviews()))
+    return None
+
+
+def install_key_forwarding():
+    # Own the whole key path: NSApp.sendEvent sees every key event before
+    # WebKit's responder chain, which never delivered arrows reliably.
+    # Forward each non-command keydown into the webview as a synthetic
+    # KeyboardEvent and consume it natively, so nothing beeps.
+    try:
+        import AppKit
+        import objc
+
+        class LagoonApplication(AppKit.NSApplication):
+            def sendEvent_(self, event):
+                try:
+                    if event.type() == AppKit.NSKeyDown:
+                        mods = event.modifierFlags()
+                        if not mods & AppKit.NSEventModifierFlagCommand:
+                            win = self.keyWindow()
+                            wv = find_webview(win) if win is not None else None
+                            if wv is not None:
+                                kc = event.keyCode()
+                                chars = event.charactersIgnoringModifiers() or ""
+                                key = KEYCODES.get(kc)
+                                if key is None and len(event.characters() or "") == 1:
+                                    # characters() keeps shift, so typing into the
+                                    # on-chart label editor yields real symbols
+                                    key = KEY_MAP.get(chars, event.characters())
+                                with contextlib.suppress(OSError):
+                                    with open(DIR / "keys.log", "a") as f:
+                                        f.write(utcnow() + " kc=" + str(kc) + " chars=" + repr(chars) + " key=" + repr(key) + "\n")
+                                if key:
+                                    js = (
+                                        "window.dispatchEvent(new KeyboardEvent('keydown',{key:"
+                                        + json.dumps(key)
+                                        + ",ctrlKey:" + ("true" if mods & AppKit.NSEventModifierFlagControl else "false")
+                                        + ",altKey:" + ("true" if mods & AppKit.NSEventModifierFlagOption else "false")
+                                        + ",shiftKey:" + ("true" if mods & AppKit.NSEventModifierFlagShift else "false")
+                                        + "}));"
+                                    )
+                                    wv.evaluateJavaScript_completionHandler_(js, None)
+                                    return
+                except Exception:
+                    pass
+                objc.super(LagoonApplication, self).sendEvent_(event)
+
+        LagoonApplication.sharedApplication()
+        with contextlib.suppress(OSError):
+            (DIR / "panel-patch.log").write_text("sendEvent ok")
+            (DIR / "keys.log").write_text("")
+    except Exception as e:
+        with contextlib.suppress(OSError):
+            (DIR / "panel-patch.log").write_text(repr(e))
+
+
+def focus_webview():
+    # pywebview fires events off the main thread; AppKit calls from there crash
+    try:
+        from PyObjCTools import AppHelper
+        AppHelper.callAfter(focus_webview_main)
+    except Exception:
+        pass
+
+
+def focus_webview_main():
+    try:
+        from AppKit import NSApp
+        NSApp.activateIgnoringOtherApps_(True)
+        win = NSApp.keyWindow() or NSApp.mainWindow()
+        if win is None:
+            return
+        win.makeKeyAndOrderFront_(None)
+        v = find_webview(win)
+        if v is not None:
+            win.makeFirstResponder_(v)
+    except Exception:
+        pass
+
+
+def cmd__panel(args):
+    if sys.platform == "darwin":
+        install_key_forwarding()
+    import webview
+
+    windows = []
+    if len(args.names) == 2:
+        windows.append(webview.create_window(
+            "Lagoon", f"http://127.0.0.1:{PORT}/#{args.names[0]}+{args.names[1]}",
+            width=920, height=520, min_size=(480, 320), js_api=PanelApi(),
+        ))
+    else:
+        for name in args.names or [None]:
+            url = f"http://127.0.0.1:{PORT}/" + (f"#{name}" if name else "")
+            windows.append(webview.create_window(
+                "Lagoon", url, width=520, height=440, min_size=(320, 240), js_api=PanelApi()
+            ))
+    if sys.platform == "darwin":
+        for w in windows:
+            w.events.shown += focus_webview
+    webview.start()
+
+
+def cmd_open(args):
+    ensure_daemon()
+    webbrowser.open(f"http://127.0.0.1:{PORT}/")
+
+
+def cmd_push(args):
+    if bad_name(args.name):
+        sys.exit("lagoon: names are [A-Za-z0-9._-], up to 64 chars ('latest' is reserved)")
+    data = sys.stdin.read()
+    if not data.strip():
+        sys.exit("lagoon: empty stdin")
+    resp = sock_request(f"push {args.name}\n{data}\n")
+    if not resp.get("ok"):
+        sys.exit("lagoon: " + str(resp.get("error")))
+    print(f"pushed {resp['name']} (ver {resp['ver']})")
+
+
+def cmd_show(args):
+    if bad_name(args.name):
+        sys.exit("lagoon: names are [A-Za-z0-9._-], up to 64 chars ('latest' is reserved)")
+    resp = sock_request(f"show {args.name}\n")
+    if not resp.get("ok"):
+        sys.exit("lagoon: " + str(resp.get("error")))
+    print(f"showing {resp['name']} (ver {resp['ver']})")
+
+
+def cmd_list(args):
+    resp = sock_request("list\n")
+    if not resp.get("ok"):
+        sys.exit("lagoon: " + str(resp.get("error")))
+    for name in resp["charts"]:
+        print(("* " if name == resp.get("current") else "  ") + name)
+    for mid in resp.get("merges", []):
+        print("= " + mid)
+
+
+def cmd_unmerge(args):
+    parts = args.id.split("+")
+    if len(parts) < 2 or any(bad_name(p) for p in parts):
+        sys.exit("lagoon: merged view ids look like 'chart-a+chart-b'")
+    resp = sock_request(f"unmerge {args.id}\n")
+    if not resp.get("ok"):
+        sys.exit("lagoon: " + str(resp.get("error")))
+    print("removed merged view " + resp["removed"])
+
+
+def cmd_compare(args):
+    if len(args.names) < 2:
+        sys.exit("lagoon: compare needs 2+ chart names")
+    for n in args.names:
+        if bad_name(n):
+            sys.exit("lagoon: names are [A-Za-z0-9._-], up to 64 chars ('latest' is reserved)")
+    resp = sock_request("compare " + " ".join(args.names) + "\n")
+    if not resp.get("ok"):
+        sys.exit("lagoon: " + str(resp.get("error")))
+    print("comparing " + " | ".join(resp["charts"]) + f" ({resp['panels']} panel(s) connected)")
+
+
+def cmd_offsets(args):
+    if bad_name(args.name):
+        sys.exit("lagoon: names are [A-Za-z0-9._-], up to 64 chars ('latest' is reserved)")
+    resp = sock_request(f"offsets {args.name}\n")
+    if not resp.get("ok"):
+        sys.exit("lagoon: " + str(resp.get("error")))
+    print(json.dumps(resp["offsets"], indent=2))
+
+
+def cmd_history(args):
+    name = args.name or ""
+    if name and bad_name(name):
+        sys.exit("lagoon: names are [A-Za-z0-9._-], up to 64 chars ('latest' is reserved)")
+    resp = sock_request(("history " + name).strip() + "\n")
+    if not resp.get("ok"):
+        sys.exit("lagoon: " + str(resp.get("error")))
+    for e in resp["entries"]:
+        print(f"{e['ver']:>4}  {e['at']}  {e['name']}")
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="lagoon",
+        description="a small floating mermaid portal",
+        epilog=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("serve", help="run the daemon")
+    p = sub.add_parser("panel", help="open panel window(s); names pin individual charts")
+    p.add_argument("names", nargs="*")
+    sub.add_parser("open", help="open the portal in a browser")
+    p = sub.add_parser("push", help="push mermaid from stdin")
+    p.add_argument("name", nargs="?", default="scratch")
+    p = sub.add_parser("show", help="bring a named chart back to the portal")
+    p.add_argument("name")
+    sub.add_parser("list", help="list charts (* marks current)")
+    p = sub.add_parser("compare", help="open a split compare of 2+ charts on the portal")
+    p.add_argument("names", nargs="+")
+    p = sub.add_parser("offsets", help="print a chart's stored drag nudges")
+    p.add_argument("name")
+    p = sub.add_parser("history", help="print recent push history (all, or one chart)")
+    p.add_argument("name", nargs="?")
+    p = sub.add_parser("unmerge", help="remove a persisted merged view")
+    p.add_argument("id")
+    p = sub.add_parser("_panel", help=argparse.SUPPRESS)
+    p.add_argument("names", nargs="*")
+    args = ap.parse_args()
+    {
+        "serve": cmd_serve,
+        "panel": cmd_panel,
+        "_panel": cmd__panel,
+        "open": cmd_open,
+        "push": cmd_push,
+        "show": cmd_show,
+        "list": cmd_list,
+        "compare": cmd_compare,
+        "offsets": cmd_offsets,
+        "history": cmd_history,
+        "unmerge": cmd_unmerge,
+    }[args.cmd](args)
+
+
+if __name__ == "__main__":
+    main()

@@ -110,7 +110,8 @@ PAGE = r"""<!doctype html>
   #stage { flex: 1 1 auto; overflow: hidden; position: relative;
            touch-action: none; user-select: none; cursor: grab; }
   #stage.dragging { cursor: grabbing; }
-  #chart { position: absolute; top: 0; left: 0; transform-origin: 0 0; will-change: transform; }  /* own composited layer: WebKit otherwise repaints the transformed SVG during pan and smears */
+  #chart { position: absolute; top: 0; left: 0; transform-origin: 0 0; }  /* pan-time compositing comes from body.panning — a permanent will-change layer would clip dragged content at the svg's original bounds */
+  body.panning #chart { will-change: transform; }
   #msg { position: absolute; top: 12px; left: 12px; right: 12px;
          color: #ff7b72; white-space: pre-wrap; }
   #merge, #cancel, #undo, #redo, #reset, #openmmd, #copymmd, #copypng, #savepng, #regen, #sort, #help { background: #1a1f27; color: #c9ced6; border: 1px solid #2a3140;
@@ -232,8 +233,14 @@ function show(text) {
   $("pos").textContent = "";
 }
 
+let panLayerT = 0;
 function apply() {
   $("chart").style.transform = "translate(" + tx + "px," + ty + "px) scale(" + scale + ")";
+  // promote to a composited layer only while panning/zooming: kills the pan smear,
+  // but a permanent layer would clip dragged nodes at the svg's original bounds
+  document.body.classList.add("panning");
+  clearTimeout(panLayerT);
+  panLayerT = setTimeout(() => document.body.classList.remove("panning"), 150);
 }
 
 function fit() {

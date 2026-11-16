@@ -13,17 +13,19 @@ commands:
   history [name] print recent pushes (all charts, or one)
   open           open the portal in the default browser
 
-panel: one tab per chart name (click or keys 1-8, 9 = last, • = changed while away);
+panel: left explorer panel lists charts (click or keys 1-8, 9 = last,
+       • = changed while away; / fuzzy-searches the list, the sort button toggles
+       a-z / most-recent);
        drag pans, pinch / ctrl+wheel or + - zooms, 0 or double-click fits,
        arrows walk the current view's history, Escape jumps to latest, s saves a PNG
-       to ~/Downloads, c copies the mermaid source, and the bar offers copy mmd /
-       copy png / save png / open file, x resets manual layout. dragging a node (or a
+       to ~/Downloads, c copies the mermaid source, and the sidebar's action row
+       offers copy mmd / copy png / save png / open file, x resets manual layout. dragging a node (or a
        subgraph's empty area) nudges it; edges and arrowheads follow, and nudges
        persist per chart; double-click an edge's text label to edit it (enter
        saves, clear-all + enter removes). shift+drag on empty space
        rubber-band-picks several cells to drag as one group; Esc or a plain
-       click clears the pick. ctrl+tab / ctrl+shift+tab cycle the tab strip
-       (wrapping, merged tabs included); arrows walk the current view's history.
+       click clears the pick. ctrl+tab / ctrl+shift+tab cycle the explorer list
+       (wrapping, merged views included); arrows walk the current view's history.
        lagoon panel a b (or the merge button: tabs become selectors, then
        "merge (N)" / cancel) opens a split compare — nodes only in a pane
        tint that pane's color; "end merge" or Escape returns. Merge supports
@@ -76,26 +78,41 @@ PAGE = r"""<!doctype html>
   :root { color-scheme: dark; }
   html, body { height: 100%; margin: 0; }
   body { background: #0f1115; color: #c9ced6; font: 12px ui-monospace, Menlo, monospace;
-         display: flex; flex-direction: column; }
+         display: flex; flex-direction: row; }
+  #side { flex: 0 0 192px; display: flex; flex-direction: column; min-height: 0;
+          border-right: 1px solid #232933; }
+  #main { flex: 1 1 auto; display: flex; flex-direction: column; min-width: 0; }
   #bar { flex: 0 0 auto; display: flex; justify-content: space-between; gap: 8px;
          padding: 4px 10px; border-bottom: 1px solid #232933; user-select: none;
          overflow: hidden; white-space: nowrap; }
+  #sidehead { flex: 0 0 auto; display: flex; gap: 4px; padding: 6px;
+              border-bottom: 1px solid #232933; }
+  #q { flex: 1 1 auto; min-width: 0; background: #141821; border: 1px solid #2a3140;
+       border-radius: 4px; padding: 2px 6px; overflow: hidden; white-space: nowrap;
+       cursor: text; user-select: none; }
+  #q.blank::before { content: "search (/)"; color: #5b6675; }
+  body.qfocus #q { border-color: #3b82f6; }
+  body.qfocus #q::after { content: ""; display: inline-block; width: 1px; height: 1em;
+                          background: #c9d4e3; vertical-align: -2px; margin-left: 1px;
+                          animation: lagoon-blink 1s step-end infinite; }
+  #tabs { flex: 1 1 auto; overflow-y: auto; padding: 4px; min-height: 0; user-select: none; }
+  .tab { display: block; padding: 2px 8px; border-radius: 4px; cursor: pointer;
+         overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .tab:hover { background: #1a2230; }
+  .tab.active { background: #232b38; }
+  .tab.sel { outline: 2px solid #7aa2f7; outline-offset: -2px; }
+  .tab.hit { outline: 1px dashed #22d3ee; outline-offset: -2px; }
+  #actions { flex: 0 0 auto; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
+             gap: 3px; padding: 6px; border-top: 1px solid #232933; user-select: none; }
   #stage { flex: 1 1 auto; overflow: hidden; position: relative;
            touch-action: none; user-select: none; cursor: grab; }
   #stage.dragging { cursor: grabbing; }
-  #chart { position: absolute; top: 0; left: 0; transform-origin: 0 0; }
+  #chart { position: absolute; top: 0; left: 0; transform-origin: 0 0; will-change: transform; }  /* own composited layer: WebKit otherwise repaints the transformed SVG during pan and smears */
   #msg { position: absolute; top: 12px; left: 12px; right: 12px;
          color: #ff7b72; white-space: pre-wrap; }
-  #actions { display: flex; gap: 4px; flex: 0 0 auto; }
-  #merge, #cancel, #undo, #redo, #reset, #openmmd, #copymmd, #copypng, #savepng, #regen, #help { background: #1a1f27; color: #c9ced6; border: 1px solid #2a3140;
+  #merge, #cancel, #undo, #redo, #reset, #openmmd, #copymmd, #copypng, #savepng, #regen, #sort, #help { background: #1a1f27; color: #c9ced6; border: 1px solid #2a3140;
                                                    border-radius: 4px; padding: 1px 8px; font: inherit; cursor: pointer; }
   #cancel[hidden] { display: none; }
-  .tab.sel { outline: 2px solid #7aa2f7; }
-  #tabs { flex: 0 0 auto; display: flex; gap: 2px; padding: 3px 6px;
-          border-bottom: 1px solid #232933; overflow-x: auto; user-select: none; }
-  .tab { flex: 0 0 auto; padding: 1px 8px; border: 1px solid #2a3140;
-         border-radius: 4px; background: #141821; cursor: pointer; }
-  .tab.active { background: #232b38; border-color: #3d4759; }
   #chart .node, #chart .cluster { cursor: move; }
   .lagoon-handle { stroke: #3b82f6; stroke-width: 2; fill: none; cursor: pointer; }
   .lagoon-handle circle { fill: transparent; }  /* invisible hit area around the X */
@@ -118,20 +135,22 @@ PAGE = r"""<!doctype html>
   #split iframe { flex: 1 1 50%; border: 0; }
   #split iframe:not(:last-child) { border-right: 2px solid #3d4759; }
   body.split-mode #stage, body.split-mode #openmmd, body.split-mode #copymmd, body.split-mode #copypng, body.split-mode #savepng, body.split-mode #regen, body.split-mode .flag { display: none; }
-  .flag { font: inherit; color: #9aa7b8; display: flex; align-items: center; gap: 4px; cursor: pointer; }
+  .flag { font: inherit; color: #9aa7b8; display: flex; align-items: center; gap: 4px; cursor: pointer;
+           grid-column: 1 / -1; }  /* checkbox + help span the full row: pair-shaped buttons stay 50/50 */
+  #help { grid-column: 1 / -1; }
   #helpcard { position: absolute; top: 36px; right: 8px; max-width: 620px; z-index: 10; background: #141821;
               border: 1px solid #3d4759; border-radius: 6px; padding: 10px 14px; font-size: 12px;
               line-height: 1.6; color: #c9d4e3; box-shadow: 0 6px 24px rgba(0,0,0,.5); }
-  .embedded #tabs { display: none; }
+  .embedded #sidehead, .embedded #tabs { display: none; }
   .embedded #merge, .embedded #cancel { display: none; }
 </style>
 </head>
 <body>
-<div id="bar"><span id="name">lagoon</span><span id="pos"></span><span id="actions"><button id="undo" hidden title="undo manual layout tweaks (ctrl+z)">undo</button><button id="redo" hidden title="redo (ctrl+shift+z / ctrl+y)">redo</button><button id="reset" hidden title="clear all manual layout tweaks (x)">reset</button><button id="merge" title="pick charts to compare side by side">merge</button><button id="cancel" hidden>cancel</button><button id="openmmd" title="open this chart's .mmd source file in your editor">open file</button><button id="copymmd" title="copy the mermaid source, without manual layout tweaks (c)">copy mmd</button><button id="copypng" title="copy the rendered diagram as a PNG image to the clipboard">copy png</button><button id="savepng" title="export the whole diagram as 2x PNG to ~/Downloads (s)">save png</button><button id="regen" title="re-render this chart from source, discarding render glitches">regen</button><label class="flag" title="keep mermaid/dagre's original edge routing for this chart instead of the border-anchored swoop"><input type="checkbox" id="legacy">dagre edges</label><button id="help" title="keyboard, drag, and edit reference">?</button></span></div>
-<div id="helpcard" hidden><p><b>tabs</b> — ctrl+tab / ctrl+shift+tab cycle the strip (wrapping, merged tabs included) · 1-8 jump by index, 9 = last · <i>latest</i> = live stream of every push · • = chart changed while away</p><p><b>history</b> — ←/→ walks the current view's versions · Esc: close help → cancel selection → leave merged view → jump to latest</p><p><b>shortcuts</b> — cmd/ctrl+R reset layout · cmd/ctrl+P or s = png · c or the copy button = mermaid source to clipboard · m merge toggle · c copy source · x reset tweaks · 0 or dblclick empty space = fit · +/- zoom · ctrl+z / ctrl+shift+z / ctrl+y undo-redo: layout tweaks first, then falls through to version history so edge edits undo too</p><p><b>drag</b> — 3px arms a drag (clicks never write offsets) · drag a gray cluster to move its members together · subgraph boxes always refit around their contents, so cells can stretch but never escape their group · double-click a cell for edge edit mode: drag a blue X to re-point that edge, click an X to delete it, drag from the cell body to create a new edge (drop on itself = self-loop) · Esc cancels · every edge edit pushes a new version — undo with ←/→ · refuses chained-edge lines (A --> B --> C) and charts using linkStyle (positional indices would drift)</p><p><b>select</b> — shift+drag on empty space (or a subgraph's background) rubber-band-picks several cells · shift+click adds/removes one · drag any picked cell, shift held or not, to move them all · Esc or a plain click clears</p><p><b>edges</b> — default: border-anchored swoopy connector between nodes, drawn on first render so dragging never snaps · "dagre edges" per-chart checkbox: mermaid's original routing preserved, stretched affinely on drags · double-click a line's label to edit its text (enter saves, esc cancels, clear-all + enter removes it)</p><p><b>png</b> — save png: 2x image to ~/Downloads, [open] button beside the path · copy png: image straight to the clipboard · copy mmd: source without manual layout tweaks · open file: the chart's .mmd in your default editor · handles/ghosts never export</p><p><b>regen</b> — re-render this chart from source, clearing render glitches without touching history</p></div>
-<div id="tabs"></div>
+<div id="side"><div id="sidehead"><div id="q" class="blank" title="fuzzy chart search — / to focus, type filters, up/down picks, enter opens, esc clears"></div><button id="sort" title="cycle sort: chart name / most recent push">a-z</button></div><div id="tabs"></div><div id="actions"><button id="undo" hidden title="undo manual layout tweaks (ctrl+z)">undo</button><button id="redo" hidden title="redo (ctrl+shift+z / ctrl+y)">redo</button><button id="reset" hidden title="clear all manual layout tweaks (x)">reset</button><button id="merge" title="pick charts to compare side by side">merge</button><button id="cancel" hidden>cancel</button><button id="openmmd" title="open this chart's .mmd source file in your editor">open file</button><button id="copymmd" title="copy the mermaid source, without manual layout tweaks (c)">copy mmd</button><button id="copypng" title="copy the rendered diagram as a PNG image to the clipboard">copy png</button><button id="savepng" title="export the whole diagram as 2x PNG to ~/Downloads (s)">save png</button><button id="regen" title="re-render this chart from source, discarding render glitches">regen</button><label class="flag" title="keep mermaid/dagre's original edge routing for this chart instead of the border-anchored swoop"><input type="checkbox" id="legacy">dagre edges</label><button id="help" title="keyboard, drag, and edit reference">?</button></div></div>
+<div id="main"><div id="bar"><span id="name">lagoon</span><span id="pos"></span></div>
 <div id="split" hidden></div>
-<div id="stage"><div id="chart"></div><div id="msg" hidden></div></div>
+<div id="stage"><div id="chart"></div><div id="msg" hidden></div></div></div>
+<div id="helpcard" hidden><p><b>explorer</b> — left panel lists charts · / focuses fuzzy search (type filters, ↑/↓ picks, enter opens, esc clears) · sort button toggles a-z / recent · ctrl+tab / ctrl+shift+tab cycle the list (wrapping, merged views included) · 1-8 jump by index, 9 = last · <i>latest</i> = live stream of every push · • = chart changed while away · ctrl+click a chart to merge it with the current one</p><p><b>history</b> — ←/→ walks the current view's versions · Esc: close help → cancel selection → leave merged view → jump to latest</p><p><b>shortcuts</b> — cmd/ctrl+R reset layout · cmd/ctrl+P or s = png · c or the copy button = mermaid source to clipboard · m merge toggle · c copy source · x reset tweaks · 0 or dblclick empty space = fit · +/- zoom · ctrl+z / ctrl+shift+z / ctrl+y undo-redo: layout tweaks first, then falls through to version history so edge edits undo too</p><p><b>drag</b> — 3px arms a drag (clicks never write offsets) · drag a gray cluster to move its members together · subgraph boxes always refit around their contents, so cells can stretch but never escape their group · double-click a cell for edge edit mode: drag a blue X to re-point that edge, click an X to delete it, drag from the cell body to create a new edge (drop on itself = self-loop) · Esc cancels · every edge edit pushes a new version — undo with ←/→ · refuses chained-edge lines (A --> B --> C) and charts using linkStyle (positional indices would drift)</p><p><b>select</b> — shift+drag on empty space (or a subgraph's background) rubber-band-picks several cells · shift+click adds/removes one · drag any picked cell, shift held or not, to move them all · Esc or a plain click clears</p><p><b>edges</b> — default: border-anchored swoopy connector between nodes, drawn on first render so dragging never snaps · "dagre edges" per-chart checkbox: mermaid's original routing preserved, stretched affinely on drags · double-click a line's label to edit its text (enter saves, esc cancels, clear-all + enter removes it)</p><p><b>png</b> — save png: 2x image to ~/Downloads, [open] button beside the path · copy png: image straight to the clipboard · copy mmd: source without manual layout tweaks · open file: the chart's .mmd in your default editor · handles/ghosts never export</p><p><b>regen</b> — re-render this chart from source, clearing render glitches without touching history</p></div>
 <script src="mermaid.js"></script>
 <script>
 const $ = (id) => document.getElementById(id);
@@ -146,6 +165,9 @@ let selection = [];
 let mergedList = [];
 let scale = 1, tx = 0, ty = 0;
 const seenVer = {};
+let qText = "", qFocus = false, qIdx = 0;
+let sideSort = "name";  // or "recent"; sticky across sessions
+try { if (localStorage.getItem("lagoon-sort") === "recent") sideSort = "recent"; } catch (err) { }
 
 const pinnedName = () => {
   const h = decodeURIComponent(location.hash.replace(/^#/, ""));
@@ -159,7 +181,38 @@ const splitNames = () => {
   return SPLIT_RE.test(h) ? h.split("+") : null;
 };
 const viewList = () => (pinned === null ? hist : hist.filter((e) => e.name === pinned));
-const tabNames = () => ["latest", ...new Set(hist.map((e) => e.name)), ...mergedList.map((m) => m.id)];
+const allNames = () => ["latest", ...new Set(hist.map((e) => e.name)), ...mergedList.map((m) => m.id)];
+function fuzzyScore(q, s) {
+  // ordered-subsequence match, lower is better: skipped chars cost,
+  // consecutive hits and word starts pay off
+  q = q.toLowerCase(); s = s.toLowerCase();
+  let score = 0, si = 0, prev = -2;
+  for (const ch of q) {
+    const j = s.indexOf(ch, si);
+    if (j < 0) return null;
+    score += j - si;
+    if (j === prev + 1) score -= 4;
+    if (j === 0 || "-._+".includes(s[j - 1])) score -= 3;
+    prev = j; si = j + 1;
+  }
+  return score + si;  // earlier matches win ties
+}
+const tabNames = () => {
+  const base = allNames();
+  if (qText)  // searching: rank by fuzzy score, ignore the sort mode
+    return base.map((n) => [fuzzyScore(qText, n), n])
+               .filter((p) => p[0] !== null)
+               .sort((a, b) => a[0] - b[0] || a[1].localeCompare(b[1]))
+               .map((p) => p[1]);
+  const charts = base.filter((n) => n !== "latest" && !n.includes("+"));
+  const merges = base.filter((n) => n.includes("+"));
+  if (sideSort === "recent") {
+    const lastAt = (n) => { const l = hist.filter((e) => e.name === n).at(-1); return l ? l.at : ""; };
+    charts.sort((a, b) => lastAt(b).localeCompare(lastAt(a)) || a.localeCompare(b));
+  } else charts.sort((a, b) => a.localeCompare(b));
+  merges.sort((a, b) => a.localeCompare(b));
+  return ["latest", ...charts, ...merges];  // latest (live stream) stays pinned on top
+};
 const currentTab = () => {
   const sp = splitNames();
   if (sp) return sp.join("+");
@@ -891,6 +944,19 @@ $("legacy").addEventListener("change", async () => {
   try { await fetch("/flags/" + encodeURIComponent(curChart), { method: "POST", body: JSON.stringify({ legacyEdges }) }); } catch (err) { }
   renderEntry(cursor);
 });
+$("q").addEventListener("mousedown", (ev) => {
+  ev.preventDefault();  // no real DOM focus — the keyboard path owns this box
+  if (!qFocus) { qFocus = true; renderTabs(); }
+});
+$("sort").addEventListener("click", () => {
+  sideSort = sideSort === "recent" ? "name" : "recent";
+  try { localStorage.setItem("lagoon-sort", sideSort); } catch (err) { }
+  qIdx = 0;
+  renderTabs();
+});
+document.addEventListener("mousedown", (ev) => {
+  if (qFocus && ev.target && ev.target.closest && !ev.target.closest("#q")) { qFocus = false; renderTabs(); }
+});
 
 function cycleTabs(shift) {
   const names = tabNames();
@@ -951,17 +1017,21 @@ async function renderEntry(i) {
 
 function renderTabs() {
   const names = tabNames();
+  if (qIdx >= names.length) qIdx = Math.max(0, names.length - 1);
   const cur = currentTab();
   const wrap = $("tabs");
   wrap.innerHTML = "";
-  for (const n of names) {
+  let focusEl = null;
+  for (let i = 0; i < names.length; i++) {
+    const n = names[i];
     const t = document.createElement("span");
     const isMerge = n.includes("+");
     const lastEntry = hist.filter((e) => e.name === n).at(-1);
     const unread = !isMerge && n !== "latest" && n !== cur && seenVer[n] !== undefined && lastEntry && lastEntry.ver > seenVer[n];
-    t.className = "tab" + (n === cur ? " active" : "") + (selecting && selection.includes(n) ? " sel" : "");
+    if (qFocus && i === qIdx) focusEl = t;
+    t.className = "tab" + (n === cur ? " active" : "") + (selecting && selection.includes(n) ? " sel" : "") + (qFocus && i === qIdx ? " hit" : "");
     t.textContent = (unread ? "• " : "") + n;
-    t.title = isMerge ? "merged view — right-click to remove" : "";
+    t.title = (isMerge ? "merged view — right-click to remove · " : "") + n;
     if (selecting) {
       t.style.opacity = (n === "latest" || isMerge) ? 0.4 : 1;
       if (n !== "latest" && !isMerge) t.onclick = () => {
@@ -985,6 +1055,11 @@ function renderTabs() {
     }
     wrap.appendChild(t);
   }
+  (focusEl || wrap.querySelector(".tab.active") || { scrollIntoView() { } }).scrollIntoView({ block: "nearest" });
+  $("q").textContent = qText;
+  $("q").classList.toggle("blank", !qText);
+  document.body.classList.toggle("qfocus", qFocus);
+  $("sort").textContent = sideSort === "recent" ? "recent" : "a-z";
   updateMergeBtn();
   updateLayoutBtns();
 }
@@ -1333,6 +1408,44 @@ addEventListener("keydown", (ev) => {
     }
     return;
   }
+  if (qFocus) {
+    // search is keyboard-driven like the label editor: panel keys arrive as
+    // synthetic window events, which a real <input> would never receive
+    if (ev.key === "Escape") {
+      ev.preventDefault();
+      if (qText) { qText = ""; qIdx = 0; }
+      else qFocus = false;
+      renderTabs();
+      return;
+    }
+    if (ev.key === "Enter") {
+      ev.preventDefault();
+      const names = tabNames();
+      const n = names[qIdx];
+      if (n && n !== currentTab()) location.hash = n === "latest" ? "latest" : n;
+      qFocus = false;
+      renderTabs();
+      return;
+    }
+    if (ev.key === "ArrowDown" || ev.key === "ArrowUp") {
+      ev.preventDefault();
+      const names = tabNames();
+      if (names.length) {
+        qIdx = Math.max(0, Math.min(names.length - 1, qIdx + (ev.key === "ArrowDown" ? 1 : -1)));
+        renderTabs();
+      }
+      return;
+    }
+    if (ev.key === "Backspace") { ev.preventDefault(); qText = qText.slice(0, -1); qIdx = 0; renderTabs(); return; }
+    if (ev.key.length === 1 && !ev.metaKey && !ev.ctrlKey && !ev.altKey) {
+      ev.preventDefault();
+      qText += ev.key;
+      qIdx = 0;
+      renderTabs();
+      return;
+    }
+    return;  // typing owns the keyboard: shortcuts stay suspended while searching
+  }
   if (ev.key === "Escape") {
     if (!$("helpcard").hidden) { $("helpcard").hidden = true; return; }
     if (rebind) { exitRebind(); $("pos").textContent = ""; return; }
@@ -1340,6 +1453,13 @@ addEventListener("keydown", (ev) => {
     if (selecting) { selecting = false; renderTabs(); return; }
     if (splitNames()) { location.hash = "latest"; return; }
     if (viewList().length) renderEntry(viewList().length - 1);
+    return;
+  }
+  if (ev.key === "/" && !ev.metaKey && !ev.ctrlKey && !ev.altKey) {
+    ev.preventDefault();
+    qFocus = true;
+    qIdx = 0;
+    renderTabs();
     return;
   }
   if (selecting) return;
@@ -2161,13 +2281,13 @@ def cmd__panel(args):
     if len(args.names) == 2:
         windows.append(webview.create_window(
             "Lagoon", f"http://127.0.0.1:{PORT}/#{args.names[0]}+{args.names[1]}",
-            width=920, height=520, min_size=(480, 320), js_api=PanelApi(),
+            width=1100, height=560, min_size=(520, 320), js_api=PanelApi(),
         ))
     else:
         for name in args.names or [None]:
             url = f"http://127.0.0.1:{PORT}/" + (f"#{name}" if name else "")
             windows.append(webview.create_window(
-                "Lagoon", url, width=520, height=440, min_size=(320, 240), js_api=PanelApi()
+                "Lagoon", url, width=680, height=460, min_size=(420, 280), js_api=PanelApi()
             ))
     if sys.platform == "darwin":
         for w in windows:

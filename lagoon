@@ -623,8 +623,8 @@ function applyAll() {
            +r.getAttribute("x") + io[0] + +r.getAttribute("width"),
            +r.getAttribute("y") + io[1] + +r.getAttribute("height"));
     }
-    const ld = layout.labelOf.get(c), lb = layout.labelBBox.get(c);
-    if (ld && lb) grow(x + ld[0], y + ld[1], x + ld[0] + lb[0], y + ld[1] + lb[1]);
+    const labOf = layout.labelOf.get(c), lb = layout.labelBBox.get(c);
+    if (labOf && lb) grow(x + labOf[0], y + labOf[1], x + labOf[0] + lb[0], y + labOf[1] + lb[1]);
     const x = x0 - p[0], y = y0 - p[1];
     const r = c.querySelector("rect");
     r.setAttribute("x", x);

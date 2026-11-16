@@ -454,10 +454,10 @@ function buildLayout() {
     if (list.length) members.set(c, list);
   }
   // box fit data: per-side padding between the original rect and its contents
-  // (nodes + inner cluster rects), plus the label's offset from the box corner.
-  // applyAll refits each rect around its contents, so a dragged/picked cell can
-  // never end up outside its subgraph box.
-  const pad = new Map(), labelOf = new Map(), innerOf = new Map();
+  // (nodes + inner cluster rects + the label's extent — dagre widens boxes for
+  // long centered labels, and that slack must not become permanent padding),
+  // plus the label's offset from the box corner.
+  const pad = new Map(), labelOf = new Map(), innerOf = new Map(), labelBBox = new Map();
   for (const c of clusters) {
     const rc = rectOf(c);
     if (!rc) continue;
@@ -487,7 +487,12 @@ function buildLayout() {
     pad.set(c, [x0 - rc[0], y0 - rc[1], (rc[0] + rc[2]) - x1, (rc[1] + rc[3]) - y1]);
     const lab = c.querySelector("g.cluster-label");
     const m = lab && (lab.getAttribute("transform") || "").match(/translate\(\s*(-?[\d.e]+)[ ,]+(-?[\d.e]+)/);
-    if (m) labelOf.set(c, [+m[1] - rc[0], +m[2] - rc[1]]);
+    if (m) {
+      labelOf.set(c, [+m[1] - rc[0], +m[2] - rc[1]]);
+      const lb = lab.getBBox();
+      if (lb.width && lb.height) labelBBox.set(c, [lb.width, lb.height]);
+      grow(+m[1], +m[2], +m[1] + lb.width, +m[2] + lb.height);  // label is content too — it must not leak into the padding slack
+    }
   }
   clusters.sort((a, b) => (rectOf(a) || [0, 0, 0, 0])[2] * (rectOf(a) || [0, 0, 0, 1])[3]
                          - (rectOf(b) || [0, 0, 0, 0])[2] * (rectOf(b) || [0, 0, 0, 1])[3]);  // inner boxes first
@@ -618,6 +623,8 @@ function applyAll() {
            +r.getAttribute("x") + io[0] + +r.getAttribute("width"),
            +r.getAttribute("y") + io[1] + +r.getAttribute("height"));
     }
+    const ld = layout.labelOf.get(c), lb = layout.labelBBox.get(c);
+    if (ld && lb) grow(x + ld[0], y + ld[1], x + ld[0] + lb[0], y + ld[1] + lb[1]);
     const x = x0 - p[0], y = y0 - p[1];
     const r = c.querySelector("rect");
     r.setAttribute("x", x);

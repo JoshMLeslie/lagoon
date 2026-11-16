@@ -484,7 +484,8 @@ function buildLayout() {
     }
     if (x0 === Infinity) continue;
     innerOf.set(c, inners);
-    pad.set(c, [x0 - rc[0], y0 - rc[1], (rc[0] + rc[2]) - x1, (rc[1] + rc[3]) - y1]);
+    pad.set(c, [Math.min(x0 - rc[0], 20), Math.min(y0 - rc[1], 20),
+                   Math.min((rc[0] + rc[2]) - x1, 20), Math.min((rc[1] + rc[3]) - y1, 20)]);  // clamp: dagre/mermaid emit wildly oversized cluster rects on some charts, and that slack must not become permanent padding
     const lab = c.querySelector("g.cluster-label");
     const m = lab && (lab.getAttribute("transform") || "").match(/translate\(\s*(-?[\d.e]+)[ ,]+(-?[\d.e]+)/);
     if (m) {

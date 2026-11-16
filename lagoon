@@ -1269,6 +1269,7 @@ stage.addEventListener("pointerdown", (ev) => {
   }
   if (picked.size) { picked.clear(); markPicked(); }
   drag = { x: ev.clientX, y: ev.clientY, tx: tx, ty: ty };
+  document.body.classList.add("panning");  // hold the composited layer for the whole pan gesture — timer gaps must not drop it mid-pan
   stage.setPointerCapture(ev.pointerId);
   stage.classList.add("dragging");
 });
@@ -1369,6 +1370,7 @@ const endDrag = (ev) => {
   }
   drag = null;
   stage.classList.remove("dragging");
+  document.body.classList.remove("panning");
 };
 stage.addEventListener("pointerup", endDrag);
 stage.addEventListener("pointercancel", endDrag);

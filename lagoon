@@ -121,7 +121,7 @@ PAGE = r"""<!doctype html>
   .lagoon-handle { stroke: #3b82f6; stroke-width: 2; fill: none; cursor: pointer; }
   .lagoon-handle circle { fill: transparent; }  /* invisible hit area around the X */
   .lagoon-ghost { stroke: #3b82f6; stroke-dasharray: 4 3; stroke-width: 1.5; pointer-events: none; }
-  #chart svg { overflow: visible; -webkit-user-select: none; transform: translateZ(0); }  /* own layer: WebKit re-rasterizes svg out-of-bounds paint on #chart's layer otherwise, smearing the big cluster rects */
+  #chart svg { overflow: visible; -webkit-user-select: none; }  /* dragged content must paint past dagre's original bounds; expandSvg() grows the root to cover it so no out-of-bounds paint exists (that paint is what tore during pan) */
   #chart g.edgeLabel { cursor: text; }
   .lagoon-edit { position: absolute; z-index: 20; background: #141821; border: 1px solid #3b82f6;
                  border-radius: 4px; padding: 3px 6px; font: inherit; color: #c9d4e3; white-space: pre; cursor: text; }
@@ -564,6 +564,22 @@ function applyEdge(e) {
 
 
 
+function expandSvg() {
+  // grow the svg root to cover painted content (mermaid roots are fixed-size, no viewBox):
+  // out-of-bounds paint is what smeared during pan and what a composited layer would clip
+  const svg = $("chart").querySelector("svg");
+  if (!svg || svg.getAttribute("viewBox")) return;
+  const bb = svg.getBBox();
+  if (!isFinite(bb.width) || !isFinite(bb.height) || !bb.width || !bb.height) return;
+  const m = 8;
+  const w = Math.max(+svg.getAttribute("width") || 0, Math.ceil(bb.x + bb.width + m));
+  const h = Math.max(+svg.getAttribute("height") || 0, Math.ceil(bb.y + bb.height + m));
+  if (w > +svg.getAttribute("width") || h > +svg.getAttribute("height")) {
+    svg.setAttribute("width", String(w));
+    svg.setAttribute("height", String(h));
+  }
+}
+
 function applyAll() {
   if (!layout) return;
   for (const g of layout.nodes) {
@@ -614,6 +630,7 @@ function applyAll() {
     if (ld && lab) lab.setAttribute("transform", "translate(" + (x + ld[0]) + "," + (y + ld[1]) + ")");
   }
   for (const e of layout.edges) applyEdge(e);
+  expandSvg();
 }
 
 let rebind = null;
@@ -966,29 +983,28 @@ $("sort").addEventListener("click", () => {
   renderTabs();
 });
 document.addEventListener("mousedown", (ev) => {
-  if (qFocus && ev.target && ev.target.closest && !ev.target.closest("#q")) { qFocus = false; renderTabs(); }
+  if (qFocus && ev.target && ev.target.closest && !ev.target.closest("#q")) { qFocus = false; qText = ""; qIdx = 0; renderTabs(); }
 });
 (function () {  // remembered sidebar width
   let w = 0;
   try { w = parseInt(localStorage.getItem("lagoon-side-w") || "", 10) || 0; } catch (err) { }
   if (w >= 120 && w <= 480) $("side").style.flexBasis = w + "px";
 })();
-$("grip").addEventListener("mousedown", (ev) => {
+$("grip").addEventListener("pointerdown", (ev) => {
   ev.preventDefault();
-  let w = ev.clientX;
+  ev.target.setPointerCapture(ev.pointerId);  // release outside the window must still end the drag, like every stage gesture
   const move = (e) => {
-    w = Math.max(120, Math.min(480, e.clientX));
-    $("side").style.flexBasis = w + "px";
+    $("side").style.flexBasis = Math.max(120, Math.min(480, e.clientX)) + "px";
   };
   const up = () => {
-    document.removeEventListener("mousemove", move);
-    document.removeEventListener("mouseup", up);
+    ev.target.removeEventListener("pointermove", move);
+    ev.target.removeEventListener("pointerup", up);
     document.body.classList.remove("resizing");
-    try { localStorage.setItem("lagoon-side-w", String(w)); } catch (err) { }
+    try { localStorage.setItem("lagoon-side-w", String(Math.round($("side").getBoundingClientRect().width))); } catch (err) { }
   };
   document.body.classList.add("resizing");
-  document.addEventListener("mousemove", move);
-  document.addEventListener("mouseup", up);
+  ev.target.addEventListener("pointermove", move);
+  ev.target.addEventListener("pointerup", up);
 });
 
 function cycleTabs(shift) {
@@ -1457,8 +1473,10 @@ addEventListener("keydown", (ev) => {
       ev.preventDefault();
       const names = tabNames();
       const n = names[qIdx];
-      if (n && n !== currentTab()) location.hash = n === "latest" ? "latest" : n;
+      if (n && n !== currentTab()) location.hash = n === "latest" ? "latest" : encodeURIComponent(n);
       qFocus = false;
+      qText = "";  // Enter commits the pick — no invisible stale filter left behind
+      qIdx = 0;
       renderTabs();
       return;
     }
@@ -1479,7 +1497,8 @@ addEventListener("keydown", (ev) => {
       renderTabs();
       return;
     }
-    return;  // typing owns the keyboard: shortcuts stay suspended while searching
+    ev.preventDefault();
+    return;  // typing owns the keyboard — unhandled keys must not arm browser defaults (cmd+R would reload the panel)
   }
   if (ev.key === "Escape") {
     if (!$("helpcard").hidden) { $("helpcard").hidden = true; return; }
@@ -1490,7 +1509,7 @@ addEventListener("keydown", (ev) => {
     if (viewList().length) renderEntry(viewList().length - 1);
     return;
   }
-  if (ev.key === "/" && !ev.metaKey && !ev.ctrlKey && !ev.altKey) {
+  if (ev.key === "/" && !ev.metaKey && !ev.ctrlKey && !ev.altKey && window.self === window.top) {
     ev.preventDefault();
     qFocus = true;
     qIdx = 0;
@@ -1512,7 +1531,12 @@ addEventListener("keydown", (ev) => {
     return;
   }
   const meta = ev.metaKey || ev.ctrlKey;  // cmd on macOS, ctrl on Linux/GTK
-  if (meta && (ev.key === "r" || ev.key === "R")) { ev.preventDefault(); if (ev.shiftKey) resetLayout(); else renderEntry(cursor); return; }
+  if (meta && (ev.key === "r" || ev.key === "R")) {
+    ev.preventDefault();
+    if (splitNames()) return;  // merged views have no single chart to regen/reset
+    if (ev.shiftKey) resetLayout(); else renderEntry(cursor);
+    return;
+  }
   if (meta && (ev.key === "p" || ev.key === "P")) { ev.preventDefault(); savePng(); return; }
   if ((ev.key === "m" || ev.key === "M") && !meta) { toggleMerge(); return; }
   if (splitNames()) return;

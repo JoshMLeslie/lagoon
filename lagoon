@@ -81,6 +81,9 @@ PAGE = r"""<!doctype html>
          display: flex; flex-direction: row; }
   #side { flex: 0 0 192px; display: flex; flex-direction: column; min-height: 0;
           border-right: 1px solid #232933; }
+  #grip { flex: 0 0 4px; cursor: col-resize; }
+  #grip:hover { background: #2a3140; }
+  body.resizing { cursor: col-resize; user-select: none; }
   #main { flex: 1 1 auto; display: flex; flex-direction: column; min-width: 0; }
   #bar { flex: 0 0 auto; display: flex; justify-content: space-between; gap: 8px;
          padding: 4px 10px; border-bottom: 1px solid #232933; user-select: none;
@@ -147,6 +150,7 @@ PAGE = r"""<!doctype html>
 </head>
 <body>
 <div id="side"><div id="sidehead"><div id="q" class="blank" title="fuzzy chart search — / to focus, type filters, up/down picks, enter opens, esc clears"></div><button id="sort" title="cycle sort: chart name / most recent push">a-z</button></div><div id="tabs"></div><div id="actions"><button id="undo" hidden title="undo manual layout tweaks (ctrl+z)">undo</button><button id="redo" hidden title="redo (ctrl+shift+z / ctrl+y)">redo</button><button id="reset" hidden title="clear all manual layout tweaks (x)">reset</button><button id="merge" title="pick charts to compare side by side">merge</button><button id="cancel" hidden>cancel</button><button id="openmmd" title="open this chart's .mmd source file in your editor">open file</button><button id="copymmd" title="copy the mermaid source, without manual layout tweaks (c)">copy mmd</button><button id="copypng" title="copy the rendered diagram as a PNG image to the clipboard">copy png</button><button id="savepng" title="export the whole diagram as 2x PNG to ~/Downloads (s)">save png</button><button id="regen" title="re-render this chart from source, discarding render glitches">regen</button><label class="flag" title="keep mermaid/dagre's original edge routing for this chart instead of the border-anchored swoop"><input type="checkbox" id="legacy">dagre edges</label><button id="help" title="keyboard, drag, and edit reference">?</button></div></div>
+<div id="grip"></div>
 <div id="main"><div id="bar"><span id="name">lagoon</span><span id="pos"></span></div>
 <div id="split" hidden></div>
 <div id="stage"><div id="chart"></div><div id="msg" hidden></div></div></div>
@@ -956,6 +960,28 @@ $("sort").addEventListener("click", () => {
 });
 document.addEventListener("mousedown", (ev) => {
   if (qFocus && ev.target && ev.target.closest && !ev.target.closest("#q")) { qFocus = false; renderTabs(); }
+});
+(function () {  // remembered sidebar width
+  let w = 0;
+  try { w = parseInt(localStorage.getItem("lagoon-side-w") || "", 10) || 0; } catch (err) { }
+  if (w >= 120 && w <= 480) $("side").style.flexBasis = w + "px";
+})();
+$("grip").addEventListener("mousedown", (ev) => {
+  ev.preventDefault();
+  let w = ev.clientX;
+  const move = (e) => {
+    w = Math.max(120, Math.min(480, e.clientX));
+    $("side").style.flexBasis = w + "px";
+  };
+  const up = () => {
+    document.removeEventListener("mousemove", move);
+    document.removeEventListener("mouseup", up);
+    document.body.classList.remove("resizing");
+    try { localStorage.setItem("lagoon-side-w", String(w)); } catch (err) { }
+  };
+  document.body.classList.add("resizing");
+  document.addEventListener("mousemove", move);
+  document.addEventListener("mouseup", up);
 });
 
 function cycleTabs(shift) {

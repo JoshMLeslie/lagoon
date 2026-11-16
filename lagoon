@@ -121,7 +121,7 @@ PAGE = r"""<!doctype html>
   .lagoon-handle { stroke: #3b82f6; stroke-width: 2; fill: none; cursor: pointer; }
   .lagoon-handle circle { fill: transparent; }  /* invisible hit area around the X */
   .lagoon-ghost { stroke: #3b82f6; stroke-dasharray: 4 3; stroke-width: 1.5; pointer-events: none; }
-  #chart svg { overflow: visible; -webkit-user-select: none; }  /* dragged content must paint past dagre's original bounds; WebKit otherwise treats shift+drag over SVG text as native selection */
+  #chart svg { overflow: visible; -webkit-user-select: none; transform: translateZ(0); }  /* own layer: WebKit re-rasterizes svg out-of-bounds paint on #chart's layer otherwise, smearing the big cluster rects */
   #chart g.edgeLabel { cursor: text; }
   .lagoon-edit { position: absolute; z-index: 20; background: #141821; border: 1px solid #3b82f6;
                  border-radius: 4px; padding: 3px 6px; font: inherit; color: #c9d4e3; white-space: pre; cursor: text; }

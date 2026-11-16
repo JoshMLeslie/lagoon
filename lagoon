@@ -6,6 +6,7 @@ commands:
   panel [names]  open panel window(s); each given name pins that chart, none = live stream
   push [name]    push mermaid from stdin to the portal
   show <name>    bring a named chart back to the portal
+  delete <name>  delete a chart's history, source file, sidecars, and merged views containing it
   list           list charts (* marks current)
   compare <a> <b> [...]  open a split compare of charts on the portal (persists as a tab)
   unmerge <a+b>  remove a persisted merged view
@@ -116,6 +117,9 @@ PAGE = r"""<!doctype html>
          color: #ff7b72; white-space: pre-wrap; }
   #merge, #cancel, #undo, #redo, #reset, #openmmd, #copymmd, #copypng, #savepng, #regen, #sort, #help { background: #1a1f27; color: #c9ced6; border: 1px solid #2a3140;
                                                    border-radius: 4px; padding: 1px 8px; font: inherit; cursor: pointer; }
+  #delete { color: #ff7b72; }  /* red so destructive intent reads at a glance */
+  #delete.confirm { background: #dc2626; color: #fff; border-color: #dc2626; }
+  #undo:disabled, #redo:disabled { opacity: 0.4; cursor: default; }  /* always visible, dimmed when there's nothing to undo/redo */
   #cancel[hidden] { display: none; }
   #chart .node, #chart .cluster { cursor: move; }
   .lagoon-handle { stroke: #3b82f6; stroke-width: 2; fill: none; cursor: pointer; }
@@ -138,7 +142,7 @@ PAGE = r"""<!doctype html>
   #split[hidden] { display: none; }
   #split iframe { flex: 1 1 50%; border: 0; }
   #split iframe:not(:last-child) { border-right: 2px solid #3d4759; }
-  body.split-mode #stage, body.split-mode #openmmd, body.split-mode #copymmd, body.split-mode #copypng, body.split-mode #savepng, body.split-mode #regen, body.split-mode .flag { display: none; }
+  body.split-mode #stage, body.split-mode #openmmd, body.split-mode #copymmd, body.split-mode #copypng, body.split-mode #savepng, body.split-mode #regen, body.split-mode #delete, body.split-mode .flag { display: none; }
   .flag { font: inherit; color: #9aa7b8; display: flex; align-items: center; gap: 4px; cursor: pointer;
            grid-column: 1 / -1; }  /* checkbox + help span the full row: pair-shaped buttons stay 50/50 */
   #help { grid-column: 1 / -1; }
@@ -150,12 +154,12 @@ PAGE = r"""<!doctype html>
 </style>
 </head>
 <body>
-<div id="side"><div id="sidehead"><div id="q" class="blank" title="fuzzy chart search — / to focus, type filters, up/down picks, enter opens, esc clears"></div><button id="sort" title="cycle sort: chart name / most recent push">a-z</button></div><div id="tabs"></div><div id="actions"><button id="undo" hidden title="undo manual layout tweaks (ctrl+z)">undo</button><button id="redo" hidden title="redo (ctrl+shift+z / ctrl+y)">redo</button><button id="reset" hidden title="clear all manual layout tweaks (x / cmd+shift+R)">reset</button><button id="merge" title="pick charts to compare side by side">merge</button><button id="cancel" hidden>cancel</button><button id="openmmd" title="open this chart's .mmd source file in your editor">open file</button><button id="copymmd" title="copy the mermaid source, without manual layout tweaks (c)">copy mmd</button><button id="copypng" title="copy the rendered diagram as a PNG image to the clipboard">copy png</button><button id="savepng" title="export the whole diagram as 2x PNG to ~/Downloads (s)">save png</button><button id="regen" title="re-render this chart from source, discarding render glitches (cmd/ctrl+R)">regen</button><label class="flag" title="keep mermaid/dagre's original edge routing for this chart instead of the border-anchored swoop"><input type="checkbox" id="legacy">dagre edges</label><button id="help" title="keyboard, drag, and edit reference">?</button></div></div>
+<div id="side"><div id="sidehead"><div id="q" class="blank" title="fuzzy chart search — / to focus, type filters, up/down picks, enter opens, esc clears"></div><button id="sort" title="cycle sort: chart name / most recent push">a-z</button></div><div id="tabs"></div><div id="actions"><button id="undo" title="undo manual layout tweaks (ctrl+z)">undo</button><button id="redo" title="redo (ctrl+shift+z / ctrl+y)">redo</button><button id="reset" hidden title="clear all manual layout tweaks (x / cmd+shift+R)">reset</button><button id="merge" title="pick charts to compare side by side">merge</button><button id="cancel" hidden>cancel</button><button id="openmmd" title="open this chart's .mmd source file in your editor">open file</button><button id="copymmd" title="copy the mermaid source, without manual layout tweaks (c)">copy mmd</button><button id="copypng" title="copy the rendered diagram as a PNG image to the clipboard">copy png</button><button id="savepng" title="export the whole diagram as 2x PNG to ~/Downloads (s)">save png</button><button id="regen" title="re-render this chart from source, discarding render glitches (cmd/ctrl+R)">regen</button><button id="delete" title="delete this chart's history, source file, sidecars, and merged views containing it (click again to confirm; any other action cancels)">delete</button><label class="flag" title="keep mermaid/dagre's original edge routing for this chart instead of the border-anchored swoop"><input type="checkbox" id="legacy">dagre edges</label><button id="help" title="keyboard, drag, and edit reference">?</button></div></div>
 <div id="grip"></div>
 <div id="main"><div id="bar"><span id="name">lagoon</span><span id="pos"></span></div>
 <div id="split" hidden></div>
 <div id="stage"><div id="chart"></div><div id="msg" hidden></div></div></div>
-<div id="helpcard" hidden><p><b>explorer</b> — left panel lists charts · / focuses fuzzy search (type filters, ↑/↓ picks, enter opens, esc clears) · sort button toggles a-z / recent · ctrl+tab / ctrl+shift+tab cycle the list (wrapping, merged views included) · 1-8 jump by index, 9 = last · <i>latest</i> = live stream of every push · • = chart changed while away · ctrl+click a chart to merge it with the current one</p><p><b>history</b> — ←/→ walks the current view's versions · Esc: close help → cancel selection → leave merged view → jump to latest</p><p><b>shortcuts</b> — cmd/ctrl+R regen (re-render from source, no history touch) · cmd/ctrl+shift+R reset layout · cmd/ctrl+P or s = png · c or the copy button = mermaid source to clipboard · m merge toggle · c copy source · x reset tweaks · 0 or dblclick empty space = fit · +/- zoom · ctrl+z / ctrl+shift+z / ctrl+y undo-redo: layout tweaks first, then falls through to version history so edge edits undo too</p><p><b>drag</b> — 3px arms a drag (clicks never write offsets) · drag a gray cluster to move its members together · subgraph boxes always refit around their contents, so cells can stretch but never escape their group · double-click a cell for edge edit mode: drag a blue X to re-point that edge, click an X to delete it, drag from the cell body to create a new edge (drop on itself = self-loop) · Esc cancels · every edge edit pushes a new version — undo with ←/→ · refuses chained-edge lines (A --> B --> C) and charts using linkStyle (positional indices would drift)</p><p><b>select</b> — shift+drag on empty space (or a subgraph's background) rubber-band-picks several cells · shift+click adds/removes one · drag any picked cell, shift held or not, to move them all · Esc or a plain click clears</p><p><b>edges</b> — default: border-anchored swoopy connector between nodes, drawn on first render so dragging never snaps · "dagre edges" per-chart checkbox: mermaid's original routing preserved, stretched affinely on drags · double-click a line's label to edit its text (enter saves, esc cancels, clear-all + enter removes it)</p><p><b>png</b> — save png: 2x image to ~/Downloads, [open] button beside the path · copy png: image straight to the clipboard · copy mmd: source without manual layout tweaks · open file: the chart's .mmd in your default editor · handles/ghosts never export</p><p><b>regen</b> — re-render this chart from source, clearing render glitches without touching history</p></div>
+<div id="helpcard" hidden><p><b>explorer</b> — left panel lists charts · / focuses fuzzy search (type filters, ↑/↓ picks, enter opens, esc clears) · sort button toggles a-z / recent · ctrl+tab / ctrl+shift+tab cycle the list (wrapping, merged views included) · 1-8 jump by index, 9 = last · <i>latest</i> = live stream of every push · • = chart changed while away · ctrl+click a chart to merge it with the current one</p><p><b>history</b> — ←/→ walks the current view's versions · Esc: close help → cancel selection → leave merged view → jump to latest</p><p><b>shortcuts</b> — cmd/ctrl+R regen (re-render from source, no history touch) · cmd/ctrl+shift+R reset layout · cmd/ctrl+P or s = png · c or the copy button = mermaid source to clipboard · m merge toggle · c copy source · x reset tweaks · 0 or dblclick empty space = fit · +/- zoom · ctrl+z / ctrl+shift+z / ctrl+y undo-redo: layout tweaks first, then falls through to version history so edge edits undo too</p><p><b>drag</b> — 3px arms a drag (clicks never write offsets) · drag a gray cluster to move its members together · subgraph boxes always refit around their contents, so cells can stretch but never escape their group · double-click a cell for edge edit mode: drag a blue X to re-point that edge, click an X to delete it, drag from the cell body to create a new edge (drop on itself = self-loop) · Esc cancels · every edge edit pushes a new version — undo with ←/→ · refuses chained-edge lines (A --> B --> C) and charts using linkStyle (positional indices would drift)</p><p><b>select</b> — shift+drag on empty space (or a subgraph's background) rubber-band-picks several cells · shift+click adds/removes one · drag any picked cell, shift held or not, to move them all · Esc or a plain click clears</p><p><b>edges</b> — default: border-anchored swoopy connector between nodes, drawn on first render so dragging never snaps · "dagre edges" per-chart checkbox: mermaid's original routing preserved, stretched affinely on drags · double-click a line's label to edit its text (enter saves, esc cancels, clear-all + enter removes it)</p><p><b>png</b> — save png: 2x image to ~/Downloads, [open] button beside the path · copy png: image straight to the clipboard · copy mmd: source without manual layout tweaks · open file: the chart's .mmd in your default editor · handles/ghosts never export</p><p><b>delete</b> — red button deletes the current chart's history, source file, sidecars, and merged views containing it · click once to arm ("confirm <name>?"), click again to fire · any other action or Esc cancels the armed state</p><p><b>regen</b> — re-render this chart from source, clearing render glitches without touching history</p></div>
 <script src="mermaid.js"></script>
 <script>
 const $ = (id) => document.getElementById(id);
@@ -233,7 +237,9 @@ function show(text) {
   $("pos").textContent = "";
 }
 
+let confirmDel = null;  // armed delete target — any other action disarms it
 let panLayerT = 0;
+const resetConfirmDel = () => { if (confirmDel !== null) { confirmDel = null; renderTabs(); } };
 function apply() {
   $("chart").style.transform = "translate(" + tx + "px," + ty + "px) scale(" + scale + ")";
   // promote to a composited layer only while panning/zooming: kills the pan smear,
@@ -362,12 +368,12 @@ function resetLayout() {
   updateLayoutBtns();
 }
 function updateLayoutBtns() {
-  if (splitNames()) { $("reset").hidden = true; $("undo").hidden = true; $("redo").hidden = true; return; }
+  if (splitNames()) { $("reset").hidden = true; $("undo").disabled = true; $("redo").disabled = true; return; }
   const dirty = Object.keys(offsets).length > 0;
   const s = curChart ? stackOf(curChart) : null;
   $("reset").hidden = !dirty;
-  $("undo").hidden = !dirty || !s || s.idx <= 0;
-  $("redo").hidden = !dirty || !s || s.idx >= s.stack.length - 1;
+  $("undo").disabled = !dirty || !s || s.idx <= 0;
+  $("redo").disabled = !dirty || !s || s.idx >= s.stack.length - 1;
 }
 
 function pathEnds(d) {
@@ -984,6 +990,16 @@ $("q").addEventListener("mousedown", (ev) => {
   ev.preventDefault();  // no real DOM focus — the keyboard path owns this box
   if (!qFocus) { qFocus = true; renderTabs(); }
 });
+$("delete").addEventListener("click", async () => {
+  if (splitNames()) return;  // a merged view is not one chart
+  const n = pinned || (hist.at(-1) && hist.at(-1).name);
+  if (!n) return;  // nothing pushed yet
+  if (confirmDel !== n) { confirmDel = n; renderTabs(); return; }
+  confirmDel = null;
+  renderTabs();
+  try { await fetch("/delete/" + encodeURIComponent(n), { method: "POST" }); } catch (err) { }
+  // the SSE "deleted" event drives navigation and list updates across panels
+});
 $("sort").addEventListener("click", () => {
   sideSort = sideSort === "recent" ? "name" : "recent";
   try { localStorage.setItem("lagoon-sort", sideSort); } catch (err) { }
@@ -991,6 +1007,7 @@ $("sort").addEventListener("click", () => {
   renderTabs();
 });
 document.addEventListener("mousedown", (ev) => {
+  if (confirmDel !== null && ev.target && ev.target.closest && !ev.target.closest("#delete")) resetConfirmDel();
   if (qFocus && ev.target && ev.target.closest && !ev.target.closest("#q")) { qFocus = false; qText = ""; qIdx = 0; renderTabs(); }
 });
 (function () {  // remembered sidebar width
@@ -1117,6 +1134,10 @@ function renderTabs() {
   $("q").classList.toggle("blank", !qText);
   document.body.classList.toggle("qfocus", qFocus);
   $("sort").textContent = sideSort === "recent" ? "recent" : "a-z";
+  const dbtn = $("delete");
+  dbtn.hidden = !curChart;
+  dbtn.textContent = confirmDel && confirmDel === curChart ? "confirm " + curChart + "?" : "delete";
+  dbtn.classList.toggle("confirm", confirmDel !== null && confirmDel === curChart);
   updateMergeBtn();
   updateLayoutBtns();
 }
@@ -1153,6 +1174,7 @@ async function unregisterMerge(id) {
 }
 
 function applyMode() {
+  resetConfirmDel();
   const sp = splitNames();
   if (!sp) {
     document.body.classList.remove("split-mode");
@@ -1423,6 +1445,14 @@ es.onmessage = (ev) => {
       location.hash = obj.charts.map((n) => encodeURIComponent(n)).join("+");
     return;
   }
+  if (obj.type === "deleted") {
+    hist = hist.filter((e) => e.name !== obj.name);
+    if (splitNames() && splitNames().includes(obj.name)) location.hash = "latest";
+    else if (pinned === obj.name) location.hash = "latest";
+    else if (pinned === null) renderEntry(viewList().length - 1);
+    else renderTabs();
+    return;
+  }
   if (obj.type === "merges") { refreshMerges().then(() => renderTabs()); return; }
   hist.push(obj);
   if (hist.length > 500) hist.shift();
@@ -1466,6 +1496,11 @@ addEventListener("keydown", (ev) => {
       labelEdit.el.textContent = labelEdit.text;
     }
     return;
+  }
+  if (confirmDel !== null) {
+    if (ev.key === "Escape") { ev.preventDefault(); confirmDel = null; renderTabs(); return; }
+    confirmDel = null;  // any other key disarms the pending delete
+    renderTabs();
   }
   if (qFocus) {
     // search is keyboard-driven like the label editor: panel keys arrive as
@@ -1637,6 +1672,20 @@ class Store:
                         and isinstance(m.get("charts"), list)
                     ]
 
+    def delete_chart(self, name):
+        self.hist = [e for e in self.hist if e["name"] != name]
+        self.path.write_text("".join(json.dumps(e) + "\n" for e in self.hist))
+        with contextlib.suppress(FileNotFoundError):
+            (DIR / "charts" / f"{name}.mmd").unlink()
+        for suffix in (".offsets.json", ".flags.json"):
+            with contextlib.suppress(FileNotFoundError):
+                (DIR / "charts" / f"{name}{suffix}").unlink()
+        removed = [m["id"] for m in self.merges if name in m["charts"]]
+        if removed:
+            self.merges = [m for m in self.merges if name not in m["charts"]]
+            self.merges_path.write_text(json.dumps(self.merges))
+        return removed
+
     def register_merge(self, names):
         mid = "+".join(names)
         if not any(m["id"] == mid for m in self.merges):
@@ -1735,6 +1784,16 @@ class Daemon:
                     if parts[0] == "compare":
                         await self.broadcast({"type": "split", "charts": names})
                     resp = {"ok": True, "id": mid, "charts": names, "panels": len(self.clients)}
+            elif parts[0] == "delete":
+                name = parts[1] if len(parts) > 1 else ""
+                if not NAME_RE.match(name):
+                    resp = {"ok": False, "error": "bad name"}
+                else:
+                    removed = self.store.delete_chart(name)
+                    await self.broadcast({"type": "deleted", "name": name})
+                    if removed:
+                        await self.broadcast({"type": "merges"})
+                    resp = {"ok": True, "removed": name, "merges": removed}
             elif parts[0] == "unmerge":
                 mid = parts[1] if len(parts) > 1 else ""
                 if self.store.unregister_merge(mid):
@@ -1836,6 +1895,15 @@ class Daemon:
                 mid = self.store.register_merge(charts)
                 await self.broadcast({"type": "merges"})
                 return await reply_json(writer, {"ok": True, "id": mid})
+            if method == "POST" and path.startswith("/delete/"):
+                name = path[len("/delete/"):]
+                if bad_name(name):
+                    return await reply(writer, "400 Bad Request", "text/plain", "bad name")
+                removed = self.store.delete_chart(name)
+                await self.broadcast({"type": "deleted", "name": name})
+                if removed:
+                    await self.broadcast({"type": "merges"})
+                return await reply_json(writer, {"ok": True, "removed": name, "merges": removed})
             if method == "POST" and path == "/unmerge":
                 obj = await read_body(reader, headers)
                 if obj is None:
@@ -2426,6 +2494,13 @@ def cmd_history(args):
         print(f"{e['ver']:>4}  {e['at']}  {e['name']}")
 
 
+def cmd_delete(args):
+    if bad_name(args.name):
+        exit_bad_name()
+    resp = ask(f"delete {args.name}\n")
+    print("deleted " + resp["removed"] + (f" (also removed {', '.join(resp['merges'])})" if resp.get("merges") else ""))
+
+
 def main():
     ap = argparse.ArgumentParser(
         prog="lagoon",
@@ -2441,6 +2516,7 @@ def main():
     p = sub.add_parser("push", help="push mermaid from stdin")
     p.add_argument("name", nargs="?", default="scratch")
     p = sub.add_parser("show", help="bring a named chart back to the portal")
+    p = sub.add_parser("delete", help="delete a chart's history, source file, sidecars, and merged views containing it")
     p.add_argument("name")
     sub.add_parser("list", help="list charts (* marks current)")
     p = sub.add_parser("compare", help="open a split compare of 2+ charts on the portal")
@@ -2466,6 +2542,7 @@ def main():
         "offsets": cmd_offsets,
         "history": cmd_history,
         "unmerge": cmd_unmerge,
+        "delete": cmd_delete,
     }[args.cmd](args)
 
 
